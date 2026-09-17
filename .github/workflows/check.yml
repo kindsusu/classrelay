@@ -1,0 +1,23 @@
+name: Validate PoC
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci --prefix backend
+      - run: npm ci --prefix apps
+      - run: npm test --prefix backend
+      - run: npm run typecheck --prefix backend
+      - run: npm test --prefix apps
+      - run: npm run check --prefix apps
+      - run: powershell.exe -NoProfile -File native-input/build.ps1
+      - shell: pwsh
+        run: |
+          $result = Start-Process -FilePath './native-input/dist/InputGuard.exe' -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw 'InputGuard self-test failed' }
+      - run: npx wrangler deploy --dry-run
+        working-directory: backend

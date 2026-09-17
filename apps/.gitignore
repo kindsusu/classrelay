@@ -1,0 +1,6 @@
+node_modules/
+dist/
+config.json
+config.controller.json
+config.agent.json
+*.log

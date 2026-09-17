@@ -1,0 +1,7 @@
+{
+  "name": "classroom-control",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-17",
+  "durable_objects": { "bindings": [{ "name": "CLASSROOM", "class_name": "ClassroomState" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ClassroomState"] }]
+}

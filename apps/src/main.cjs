@@ -1,0 +1,323 @@
+'use strict';
+
+const { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, session } = require('electron');
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { SafetyState, ALLOWED_MODES } = require('./safety.cjs');
+
+let mainWindow;
+let config;
+let selectedSourceId = null;
+let stopping = false;
+let pollTimer;
+let watchdogTimer;
+let retryMs = 1_000;
+let loadedConfigPath;
+let inputGuard;
+let inputGuardBuffer = '';
+let lastRendererPulse = 0;
+let rendererMediaReady = false;
+let nativeGuardUnavailable = false;
+const safety = new SafetyState();
+
+function readConfig() {
+  const configPath = process.env.CLASSROOM_CONFIG
+    ? path.resolve(process.env.CLASSROOM_CONFIG)
+    : path.join(app.getPath('userData'), 'config.json');
+  loadedConfigPath = configPath;
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(configPath, 'utf8')); }
+  catch (error) { throw new Error(`설정 파일을 읽을 수 없습니다: ${configPath}\n${error.message}`); }
+  if (!['controller', 'agent'].includes(parsed.role)) throw new Error('role은 controller 또는 agent여야 합니다.');
+  if (!/^https:\/\//i.test(parsed.backendUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(parsed.backendUrl)) {
+    throw new Error('backendUrl은 HTTPS여야 합니다(로컬 개발 localhost 예외).');
+  }
+  if (typeof parsed.token !== 'string' || parsed.token.length < 8) throw new Error('token이 없거나 너무 짧습니다.');
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(parsed.deviceId || '')) throw new Error('deviceId 형식이 올바르지 않습니다.');
+  return { ...parsed, backendUrl: parsed.backendUrl.replace(/\/$/, '') };
+}
+
+function apiHeaders(extra = {}) {
+  return {
+    Authorization: `Bearer ${config.token}`,
+    'Content-Type': 'application/json',
+    ...(config.role === 'agent' ? { 'X-Device-Id': config.deviceId } : {}),
+    ...extra
+  };
+}
+
+async function api(pathname, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  let response;
+  let text;
+  try {
+    response = await fetch(`${config.backendUrl}${pathname}`, {
+      ...options,
+      headers: apiHeaders(options.headers),
+      redirect: 'error',
+      signal: controller.signal
+    });
+    text = await response.text();
+  } finally { clearTimeout(timeout); }
+  let body = null;
+  if (text) {
+    try { body = JSON.parse(text); } catch { body = { error: text }; }
+  }
+  if (!response.ok) throw new Error(body?.error || `서버 오류 ${response.status}`);
+  return body;
+}
+
+function send(channel, value) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, value);
+}
+
+function sanitizedState(state) {
+  const mode = safety.effectiveMode();
+  return { ...state, mode, stream: mode === 'practice' ? null : state.stream };
+}
+
+function writeInputGuard(command) {
+  if (inputGuard?.stdin?.writable) inputGuard.stdin.write(`${command}\n`);
+}
+
+function configureStartup(enabled) {
+  if (process.platform !== 'win32') return false;
+  if (enabled) {
+    const persistentPath = path.join(app.getPath('userData'), 'config.json');
+    if (path.resolve(loadedConfigPath) !== path.resolve(persistentPath)) {
+      fs.mkdirSync(path.dirname(persistentPath), { recursive: true });
+      fs.copyFileSync(loadedConfigPath, persistentPath);
+      loadedConfigPath = persistentPath;
+    }
+  }
+  try {
+    const persisted = JSON.parse(fs.readFileSync(loadedConfigPath, 'utf8'));
+    persisted.autoLaunch = Boolean(enabled);
+    fs.writeFileSync(loadedConfigPath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+    config.autoLaunch = Boolean(enabled);
+  } catch (error) {
+    throw new Error(`자동 실행 설정을 저장하지 못했습니다: ${error.message}`);
+  }
+  const executable = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  const args = app.isPackaged ? [] : [app.getAppPath()];
+  app.setLoginItemSettings({ openAtLogin: Boolean(enabled), path: executable, args });
+  return app.getLoginItemSettings({ path: executable, args }).openAtLogin;
+}
+
+function startupEnabled() {
+  if (process.platform !== 'win32') return false;
+  const executable = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  const args = app.isPackaged ? [] : [app.getAppPath()];
+  return app.getLoginItemSettings({ path: executable, args }).openAtLogin;
+}
+
+function startInputGuard() {
+  if (process.platform !== 'win32' || config.role !== 'agent' || config.nativeInputLock !== true) return;
+  const executable = app.isPackaged
+    ? path.join(process.resourcesPath, 'InputGuard.exe')
+    : path.resolve(__dirname, '..', '..', 'native-input', 'dist', 'InputGuard.exe');
+  if (!fs.existsSync(executable)) {
+    nativeGuardUnavailable = true;
+    dialog.showErrorBox('입력 보호 비활성', 'InputGuard.exe를 찾지 못했습니다. 안전을 위해 잠금 명령은 실행하지 않습니다.');
+    return;
+  }
+  inputGuard = spawn(executable, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  inputGuard.stdout.setEncoding('utf8');
+  inputGuard.stdout.on('data', (chunk) => {
+    inputGuardBuffer += chunk;
+    const lines = inputGuardBuffer.split(/\r?\n/);
+    inputGuardBuffer = lines.pop() || '';
+    if (lines.some((line) => ['UNLOCKED emergency', 'UNLOCKED lease-expired'].includes(line.trim()))) emergencyUnlock('네이티브 fail-safe 해제');
+  });
+  inputGuard.stdin.on('error', (error) => {
+    if (!stopping) {
+      nativeGuardUnavailable = true;
+      emergencyUnlock(`네이티브 입력 보호 통신 오류: ${error.code || error.message}`);
+    }
+  });
+  inputGuard.stderr.on('data', (chunk) => send('agent:notice', `입력 보호 도구: ${String(chunk).trim()}`));
+  inputGuard.on('error', (error) => {
+    nativeGuardUnavailable = true;
+    emergencyUnlock('네이티브 입력 보호 시작 실패');
+    dialog.showErrorBox('입력 보호 오류', `안전을 위해 잠금을 해제했습니다.\n${error.message}`);
+  });
+  inputGuard.on('exit', () => {
+    inputGuard = null;
+    if (!stopping) {
+      nativeGuardUnavailable = true;
+      emergencyUnlock('네이티브 입력 보호 종료');
+    }
+  });
+}
+
+function applyAgentWindow() {
+  if (config.role !== 'agent' || !mainWindow || mainWindow.isDestroyed()) return;
+  const mode = safety.effectiveMode();
+  if (mode === 'practice') {
+    mainWindow.setKiosk(false);
+    mainWindow.setAlwaysOnTop(false);
+    mainWindow.hide();
+  } else {
+    mainWindow.show();
+    mainWindow.setFullScreen(true);
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    mainWindow.setKiosk(mode === 'lock');
+    mainWindow.focus();
+  }
+  send('agent:mode', { mode, revision: safety.revision });
+}
+
+function emergencyUnlock(reason = 'shortcut') {
+  if (config.role !== 'agent') return;
+  safety.emergencyUnlock();
+  applyAgentWindow();
+  send('agent:notice', `비상 해제됨 (${reason}). 새 명령 전까지 유지됩니다.`);
+}
+
+async function pollAgent() {
+  if (stopping || config.role !== 'agent') return;
+  try {
+    await api('/api/heartbeat', { method: 'POST', body: '{}' });
+    const state = await api('/api/state');
+    if (safety.accept(state)) {
+      if (nativeGuardUnavailable && state.mode === 'lock') safety.emergencyUnlock();
+      applyAgentWindow();
+      send('state:update', sanitizedState(state));
+    }
+    retryMs = 1_000;
+  } catch (error) {
+    send('connection:update', { online: false, message: error.message });
+    retryMs = Math.min(retryMs * 2, 10_000);
+  } finally {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(pollAgent, Math.max(3_000, retryMs));
+  }
+}
+
+function setupDisplayCapture() {
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    try {
+      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } });
+      const source = sources.find((item) => item.id === selectedSourceId);
+      if (!source) return callback({});
+      callback({ video: source });
+    } catch { callback({}); }
+  });
+}
+
+function createWindow() {
+  const agent = config.role === 'agent';
+  mainWindow = new BrowserWindow({
+    width: agent ? 1280 : 1080,
+    height: agent ? 720 : 760,
+    show: !agent,
+    backgroundColor: '#07111f',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      devTools: !app.isPackaged,
+      backgroundThrottling: false
+    }
+  });
+  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('render-process-gone', () => emergencyUnlock('화면 프로세스 종료'));
+  mainWindow.webContents.on('did-finish-load', () => { lastRendererPulse = performance.now(); });
+  mainWindow.on('closed', () => { mainWindow = null; });
+  if (agent) mainWindow.on('close', (event) => { if (!stopping) { event.preventDefault(); emergencyUnlock('창 닫기 요청'); } });
+}
+
+function registerIpc() {
+  ipcMain.handle('config:get-public', () => ({ role: config.role, deviceId: config.deviceId, backendUrl: config.backendUrl, autoLaunch: startupEnabled() }));
+  ipcMain.on('renderer:pulse', (_event, mediaReady) => {
+    lastRendererPulse = performance.now();
+    rendererMediaReady = mediaReady === true;
+  });
+  ipcMain.on('agent:media-failed', () => {
+    if (config.role === 'agent') emergencyUnlock('영상 연결 실패');
+  });
+  ipcMain.handle('startup:set', (_event, enabled) => {
+    return configureStartup(enabled);
+  });
+  ipcMain.handle('capture:list', async () => {
+    if (config.role !== 'controller') throw new Error('controller 전용 기능입니다.');
+    const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } });
+    return sources.map((source) => ({ id: source.id, name: source.name, thumbnail: source.thumbnail.toDataURL() }));
+  });
+  ipcMain.handle('capture:select', (_event, sourceId) => {
+    if (config.role !== 'controller' || typeof sourceId !== 'string' || sourceId.length > 256) throw new Error('잘못된 화면 선택입니다.');
+    selectedSourceId = sourceId;
+    return true;
+  });
+  ipcMain.handle('api:state', async () => {
+    const state = await api('/api/state');
+    if (config.role === 'agent') {
+      safety.accept(state);
+      if (nativeGuardUnavailable && state.mode === 'lock') safety.emergencyUnlock();
+      applyAgentWindow();
+      return sanitizedState(state);
+    }
+    return state;
+  });
+  ipcMain.handle('api:heartbeat', () => api('/api/heartbeat', { method: 'POST', body: '{}' }));
+  ipcMain.handle('api:mode', (_event, payload) => {
+    if (config.role !== 'controller' || !payload || !ALLOWED_MODES.has(payload.mode)) throw new Error('허용되지 않은 모드입니다.');
+    const body = { mode: payload.mode };
+    if (payload.stream && typeof payload.stream.sessionId === 'string' && typeof payload.stream.trackName === 'string') body.stream = payload.stream;
+    return api('/api/mode', { method: 'POST', body: JSON.stringify(body) });
+  });
+  ipcMain.handle('api:ice', () => api('/api/ice'));
+  ipcMain.handle('rtc:session', (_event, body = {}) => api('/api/rtc/sessions', { method: 'POST', body: JSON.stringify(body) }));
+  ipcMain.handle('rtc:tracks', (_event, sessionId, body) => {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId || '') || !body || !Array.isArray(body.tracks)) throw new Error('잘못된 RTC 요청입니다.');
+    return api(`/api/rtc/sessions/${encodeURIComponent(sessionId)}/tracks`, { method: 'POST', body: JSON.stringify(body) });
+  });
+  ipcMain.handle('rtc:renegotiate', (_event, sessionId, body) => {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId || '') || !body) throw new Error('잘못된 RTC 요청입니다.');
+    return api(`/api/rtc/sessions/${encodeURIComponent(sessionId)}/renegotiate`, { method: 'PUT', body: JSON.stringify(body) });
+  });
+}
+
+app.whenReady().then(() => {
+  try { config = readConfig(); }
+  catch (error) {
+    config = { role: 'controller', deviceId: 'invalid', backendUrl: 'http://localhost', token: '' };
+    app.whenReady().then(() => require('electron').dialog.showErrorBox('설정 오류', error.message));
+    setImmediate(() => app.quit());
+    return;
+  }
+  registerIpc();
+  setupDisplayCapture();
+  createWindow();
+  startInputGuard();
+  globalShortcut.register('CommandOrControl+Shift+F12', () => emergencyUnlock());
+  if (config.autoLaunch === true) configureStartup(true);
+  watchdogTimer = setInterval(() => {
+    if (config.role === 'agent' && safety.effectiveMode() === 'practice' && safety.mode !== 'practice') emergencyUnlock('15초 연결 제한');
+    const rendererHealthy = performance.now() - lastRendererPulse < 4_000;
+    if (config.role === 'agent' && safety.effectiveMode() === 'lock' && !rendererHealthy) emergencyUnlock('화면 프로세스 응답 없음');
+    if (config.role === 'agent' && safety.effectiveMode() === 'lock' && rendererHealthy && rendererMediaReady) writeInputGuard(`LOCK ${safety.revision}`);
+    else writeInputGuard('UNLOCK');
+  }, 250);
+  if (config.role === 'agent') pollAgent();
+});
+
+app.on('before-quit', () => {
+  stopping = true;
+  clearTimeout(pollTimer);
+  clearInterval(watchdogTimer);
+  if (mainWindow && config?.role === 'agent') {
+    mainWindow.setKiosk(false);
+    mainWindow.setAlwaysOnTop(false);
+  }
+  writeInputGuard('UNLOCK');
+  inputGuard?.stdin?.end();
+});
+app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('window-all-closed', () => { if (config?.role !== 'agent') app.quit(); });

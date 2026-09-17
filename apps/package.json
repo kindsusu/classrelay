@@ -1,0 +1,54 @@
+{
+  "name": "classrelay-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows Controller and Agent for ClassRelay classroom screen sharing",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kindsusu/classrelay.git",
+    "directory": "apps"
+  },
+  "bugs": {
+    "url": "https://github.com/kindsusu/classrelay/issues"
+  },
+  "homepage": "https://github.com/kindsusu/classrelay#readme",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "start:controller": "set CLASSROOM_CONFIG=%CD%\\config.controller.json&& electron .",
+    "start:agent": "set CLASSROOM_CONFIG=%CD%\\config.agent.json&& electron .",
+    "test": "node --test test/*.test.cjs",
+    "check": "node --check src/main.cjs && node --check src/preload.cjs && node --check src/renderer.js && node --check src/safety.cjs",
+    "dist": "electron-builder --win portable",
+    "dist:installer": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^44.4.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "io.github.kindsusu.classrelay",
+    "productName": "ClassRelay",
+    "compression": "normal",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../native-input/dist/InputGuard.exe",
+        "to": "InputGuard.exe"
+      }
+    ],
+    "win": {
+      "target": ["portable", "nsis"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

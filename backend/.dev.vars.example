@@ -1,0 +1,10 @@
+# Never commit .dev.vars. Give every device a distinct random token.
+CONTROLLER_TOKEN=replace-with-a-long-random-controller-token
+AGENT_TOKENS_JSON={"laptop-01":"replace-with-a-long-random-device-token"}
+CLASSROOM_ID=training
+# Required for live Realtime SFU requests (kept only in Worker secrets in production).
+SFU_APP_ID=
+SFU_APP_TOKEN=
+# Optional Cloudflare TURN credentials. When blank, /api/ice returns an empty list.
+TURN_KEY_ID=
+TURN_API_TOKEN=

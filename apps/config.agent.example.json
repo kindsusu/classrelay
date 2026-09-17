@@ -1,0 +1,8 @@
+{
+  "role": "agent",
+  "backendUrl": "https://classroom.example.com",
+  "token": "replace-with-agent-token",
+  "deviceId": "student-01",
+  "autoLaunch": false,
+  "nativeInputLock": false
+}

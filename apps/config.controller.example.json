@@ -1,0 +1,7 @@
+{
+  "role": "controller",
+  "backendUrl": "https://classroom.example.com",
+  "token": "replace-with-controller-token",
+  "deviceId": "instructor-01",
+  "autoLaunch": false
+}
