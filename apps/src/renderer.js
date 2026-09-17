@@ -12,6 +12,16 @@ let pendingStreamKey = null;
 let subscriptionPromise = null;
 let subscriptionGeneration = 0;
 let agentMediaReady = false;
+let controllerOnline = false;
+let controllerConnectionGeneration = 0;
+let latestControllerState = null;
+
+function shouldStopPublishingForState(state, publication) {
+  return state?.mode === 'practice'
+    && Number.isSafeInteger(state.revision)
+    && Number.isSafeInteger(publication?.activationRevision)
+    && state.revision >= publication.activationRevision;
+}
 
 function message(text, isError = false) {
   const el = $('message');
@@ -39,9 +49,11 @@ async function waitIceComplete(pc, timeoutMs = 4_000) {
 
 async function stopPublishing() {
   if (!publishing) return;
-  publishing.stream.getTracks().forEach((track) => track.stop());
-  publishing.pc.close();
+  const active = publishing;
   publishing = null;
+  if (active.endedHandler) active.track.removeEventListener('ended', active.endedHandler);
+  active.stream.getTracks().forEach((track) => track.stop());
+  active.pc.close();
 }
 
 async function startPublishing() {
@@ -66,9 +78,10 @@ async function startPublishing() {
       sessionDescription: plainDescription(pc.localDescription)
     }), '화면 트랙 발행');
     if (result.sessionDescription) await pc.setRemoteDescription(result.sessionDescription);
-    track.addEventListener('ended', () => setPractice().catch(() => {}), { once: true });
+    const endedHandler = () => setPractice().catch(() => {});
+    track.addEventListener('ended', endedHandler, { once: true });
     const descriptor = { sessionId: session.sessionId, trackName: result.tracks?.[0]?.trackName || trackName };
-    publishing = { pc, stream, descriptor };
+    publishing = { pc, stream, track, endedHandler, descriptor, activationRevision: null };
     pc.addEventListener('connectionstatechange', () => {
       if (pc.connectionState === 'failed' && publishing?.pc === pc) {
         message('화면 송출 연결이 끊겨 실습 모드로 해제합니다.', true);
@@ -182,6 +195,7 @@ async function refreshSources() {
 }
 
 function renderControllerState(state) {
+  latestControllerState = state;
   const labels = {
     practice: ['실습 모드', '학생이 각자 노트북을 사용할 수 있습니다.'],
     broadcast: ['화면 송출 중', '강사 화면이 학생 PC에 전체화면으로 표시됩니다.'],
@@ -194,16 +208,8 @@ function renderControllerState(state) {
   $('student-count').textContent = Array.isArray(state.students) ? state.students.filter((student) => Number(student.lastSeen) >= cutoff).length : 0;
   $('connection').textContent = '서버 연결됨';
   $('connection').className = 'status status-online';
-}
-
-async function controllerPoll() {
-  try {
-    await api.heartbeat();
-    renderControllerState(await api.getState());
-  } catch (error) {
-    $('connection').textContent = '연결 끊김';
-    $('connection').className = 'status status-offline';
-    message(error.message, true);
+  if (shouldStopPublishingForState(state, publishing)) {
+    stopPublishing().catch((error) => message(error.message, true));
   }
 }
 
@@ -215,10 +221,26 @@ async function withBusy(action) {
 
 async function broadcast(mode) {
   message('화면 송출 연결을 준비하고 있습니다…');
+  const connectionGeneration = controllerConnectionGeneration;
   const descriptor = await startPublishing();
-  await api.setMode({ mode, stream: descriptor });
+  const publication = publishing;
+  try {
+    if (!controllerOnline || connectionGeneration !== controllerConnectionGeneration) {
+      throw new Error('서버 연결이 바뀌어 화면 송출 준비를 취소했습니다. 다시 시도하세요.');
+    }
+    const state = await api.setMode({ mode, stream: descriptor });
+    if (publishing !== publication) throw new Error('화면 송출 준비가 취소되었습니다.');
+    if (!Number.isSafeInteger(state?.revision)) throw new Error('서버가 유효한 모드 revision을 반환하지 않았습니다.');
+    publication.activationRevision = state.revision;
+    if (shouldStopPublishingForState(latestControllerState, publication)) {
+      await stopPublishing();
+      throw new Error('서버 안전 해제가 송출 명령보다 최신이어서 송출을 중단했습니다.');
+    }
+  } catch (error) {
+    if (publishing === publication) await stopPublishing();
+    throw error;
+  }
   message(mode === 'lock' ? '입력 차단막을 표시했습니다.' : '화면 송출을 시작했습니다.');
-  await controllerPoll();
 }
 
 async function setPractice() {
@@ -228,7 +250,6 @@ async function setPractice() {
   finally { await stopPublishing(); }
   if (modeError) throw modeError;
   message('모든 학생 PC를 실습 모드로 전환했습니다.');
-  await controllerPoll();
 }
 
 async function initController() {
@@ -242,8 +263,20 @@ async function initController() {
   $('broadcast').addEventListener('click', () => withBusy(() => broadcast('broadcast')));
   $('lock').addEventListener('click', () => withBusy(() => broadcast('lock')));
   $('practice').addEventListener('click', () => withBusy(setPractice));
-  await Promise.allSettled([refreshSources(), controllerPoll()]);
-  setInterval(controllerPoll, 3_000);
+  api.onState(renderControllerState);
+  api.onConnection((state) => {
+    if (state.online) controllerOnline = true;
+    else {
+      controllerOnline = false;
+      controllerConnectionGeneration += 1;
+      if (publishing) stopPublishing().catch((error) => message(error.message, true));
+    }
+    $('connection').textContent = state.online ? '서버 연결됨' : '연결 끊김';
+    $('connection').className = `status ${state.online ? 'status-online' : 'status-offline'}`;
+    if (!state.online && state.message) message(state.message, true);
+  });
+  api.stateReady();
+  await refreshSources();
 }
 
 function renderAgentMode(command) {
@@ -267,7 +300,7 @@ async function initAgent() {
   api.onAgentMode(renderAgentMode);
   api.onNotice((text) => { $('agent-status').textContent = text; stopSubscription(); });
   api.onConnection((state) => { if (!state.online) $('agent-status').textContent = '서버 재연결 중 · 15초 후 자동 해제'; });
-  try { await handleAgentState(await api.getState()); } catch { /* main process reconnect loop owns recovery */ }
+  api.stateReady();
 }
 
 (async () => {
@@ -279,3 +312,7 @@ async function initAgent() {
 })().catch((error) => {
   document.body.textContent = `앱 초기화 실패: ${error.message}`;
 });
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { shouldStopPublishingForState };
+}

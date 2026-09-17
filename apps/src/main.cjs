@@ -4,15 +4,19 @@ const { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, se
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const WebSocket = require('ws');
 const { SafetyState, ALLOWED_MODES } = require('./safety.cjs');
+const { ControlSocket } = require('./control-socket.cjs');
 
 let mainWindow;
 let config;
 let selectedSourceId = null;
 let stopping = false;
-let pollTimer;
 let watchdogTimer;
-let retryMs = 1_000;
+let controlSocket;
+let latestState;
+let latestConnectionState;
+let rendererStateReady = false;
 let loadedConfigPath;
 let inputGuard;
 let inputGuardBuffer = '';
@@ -42,7 +46,7 @@ function apiHeaders(extra = {}) {
   return {
     Authorization: `Bearer ${config.token}`,
     'Content-Type': 'application/json',
-    ...(config.role === 'agent' ? { 'X-Device-Id': config.deviceId } : {}),
+    'X-Device-Id': config.deviceId,
     ...extra
   };
 }
@@ -173,27 +177,35 @@ function emergencyUnlock(reason = 'shortcut') {
   if (config.role !== 'agent') return;
   safety.emergencyUnlock();
   applyAgentWindow();
+  if (latestState && rendererStateReady) send('state:update', sanitizedState(latestState));
   send('agent:notice', `비상 해제됨 (${reason}). 새 명령 전까지 유지됩니다.`);
 }
 
-async function pollAgent() {
-  if (stopping || config.role !== 'agent') return;
-  try {
-    await api('/api/heartbeat', { method: 'POST', body: '{}' });
-    const state = await api('/api/state');
-    if (safety.accept(state)) {
-      if (nativeGuardUnavailable && state.mode === 'lock') safety.emergencyUnlock();
-      applyAgentWindow();
-      send('state:update', sanitizedState(state));
-    }
-    retryMs = 1_000;
-  } catch (error) {
-    send('connection:update', { online: false, message: error.message });
-    retryMs = Math.min(retryMs * 2, 10_000);
-  } finally {
-    clearTimeout(pollTimer);
-    pollTimer = setTimeout(pollAgent, Math.max(3_000, retryMs));
+function acceptControlState(state) {
+  if (config.role === 'agent') {
+    if (!safety.accept(state)) return;
+    if (nativeGuardUnavailable && state.mode === 'lock') safety.emergencyUnlock();
+    applyAgentWindow();
+    latestState = sanitizedState(state);
+  } else {
+    latestState = state;
   }
+  if (rendererStateReady) send('state:update', latestState);
+}
+
+function startControlSocket() {
+  controlSocket = new ControlSocket({
+    WebSocket,
+    backendUrl: config.backendUrl,
+    headers: apiHeaders(),
+    canHeartbeat: () => config.role !== 'controller' || performance.now() - lastRendererPulse < 4_000,
+    onState: acceptControlState,
+    onConnection: (state) => {
+      latestConnectionState = state;
+      if (rendererStateReady) send('connection:update', state);
+    }
+  });
+  controlSocket.start();
 }
 
 function setupDisplayCapture() {
@@ -224,11 +236,14 @@ function createWindow() {
       backgroundThrottling: false
     }
   });
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('render-process-gone', () => emergencyUnlock('화면 프로세스 종료'));
-  mainWindow.webContents.on('did-finish-load', () => { lastRendererPulse = performance.now(); });
+  mainWindow.webContents.on('did-start-loading', () => {
+    lastRendererPulse = 0;
+    rendererStateReady = false;
+  });
+  mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.on('closed', () => { mainWindow = null; });
   if (agent) mainWindow.on('close', (event) => { if (!stopping) { event.preventDefault(); emergencyUnlock('창 닫기 요청'); } });
 }
@@ -238,6 +253,11 @@ function registerIpc() {
   ipcMain.on('renderer:pulse', (_event, mediaReady) => {
     lastRendererPulse = performance.now();
     rendererMediaReady = mediaReady === true;
+  });
+  ipcMain.on('state:ready', () => {
+    rendererStateReady = true;
+    if (latestState) send('state:update', config.role === 'agent' ? sanitizedState(latestState) : latestState);
+    if (latestConnectionState) send('connection:update', latestConnectionState);
   });
   ipcMain.on('agent:media-failed', () => {
     if (config.role === 'agent') emergencyUnlock('영상 연결 실패');
@@ -255,17 +275,6 @@ function registerIpc() {
     selectedSourceId = sourceId;
     return true;
   });
-  ipcMain.handle('api:state', async () => {
-    const state = await api('/api/state');
-    if (config.role === 'agent') {
-      safety.accept(state);
-      if (nativeGuardUnavailable && state.mode === 'lock') safety.emergencyUnlock();
-      applyAgentWindow();
-      return sanitizedState(state);
-    }
-    return state;
-  });
-  ipcMain.handle('api:heartbeat', () => api('/api/heartbeat', { method: 'POST', body: '{}' }));
   ipcMain.handle('api:mode', (_event, payload) => {
     if (config.role !== 'controller' || !payload || !ALLOWED_MODES.has(payload.mode)) throw new Error('허용되지 않은 모드입니다.');
     const body = { mode: payload.mode };
@@ -298,6 +307,7 @@ app.whenReady().then(() => {
   startInputGuard();
   globalShortcut.register('CommandOrControl+Shift+F12', () => emergencyUnlock());
   if (config.autoLaunch === true) configureStartup(true);
+  startControlSocket();
   watchdogTimer = setInterval(() => {
     if (config.role === 'agent' && safety.effectiveMode() === 'practice' && safety.mode !== 'practice') emergencyUnlock('15초 연결 제한');
     const rendererHealthy = performance.now() - lastRendererPulse < 4_000;
@@ -305,12 +315,11 @@ app.whenReady().then(() => {
     if (config.role === 'agent' && safety.effectiveMode() === 'lock' && rendererHealthy && rendererMediaReady) writeInputGuard(`LOCK ${safety.revision}`);
     else writeInputGuard('UNLOCK');
   }, 250);
-  if (config.role === 'agent') pollAgent();
 });
 
 app.on('before-quit', () => {
   stopping = true;
-  clearTimeout(pollTimer);
+  controlSocket?.stop();
   clearInterval(watchdogTimer);
   if (mainWindow && config?.role === 'agent') {
     mainWindow.setKiosk(false);

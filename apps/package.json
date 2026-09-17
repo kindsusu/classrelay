@@ -18,7 +18,7 @@
     "start:controller": "set CLASSROOM_CONFIG=%CD%\\config.controller.json&& electron .",
     "start:agent": "set CLASSROOM_CONFIG=%CD%\\config.agent.json&& electron .",
     "test": "node --test test/*.test.cjs",
-    "check": "node --check src/main.cjs && node --check src/preload.cjs && node --check src/renderer.js && node --check src/safety.cjs",
+    "check": "node --check src/main.cjs && node --check src/preload.cjs && node --check src/renderer.js && node --check src/safety.cjs && node --check src/control-socket.cjs",
     "dist": "electron-builder --win portable",
     "dist:installer": "electron-builder --win nsis"
   },
@@ -42,7 +42,10 @@
       }
     ],
     "win": {
-      "target": ["portable", "nsis"]
+      "target": [
+        "portable",
+        "nsis"
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -50,5 +53,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     }
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
   }
 }

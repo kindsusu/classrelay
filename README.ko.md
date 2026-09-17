@@ -6,7 +6,7 @@
 
 회사 Windows 교육용 노트북 30대를 위한 화면 송출·수업 입력 잠금 PoC. 강사는 화면을 선택해 송출하고, 학생 앱은 전체화면으로 표시한다. 실습 모드에서 해제하며 연결 장애 시 자동 해제한다.
 
-> 실계정 배포·실제 영상 송수신·30대 8시간 실증은 아직 수행하지 않았다. 계정 키와 도메인 설정 후 아래 절차로 검증한다. 입력 잠금은 교육용 사용자 세션 제어이며 Windows 보안 화면을 차단하지 않는다.
+> 실계정 배포·실제 영상 송수신·30대 5시간 실증은 아직 수행하지 않았다. 계정 키와 도메인 설정 후 아래 절차로 검증한다. 입력 잠금은 교육용 사용자 세션 제어이며 Windows 보안 화면을 차단하지 않는다.
 
 ## 구조
 
@@ -19,7 +19,7 @@ docs/architecture.ko.md  설계 결정과 보안 경계
 docs/acceptance.ko.md    1→3→10→30대 현장 검증표
 ```
 
-먼저 [아키텍처와 보안 경계](docs/architecture.ko.md)를 읽는다. 제어는 3초 폴링이므로 실습 전환 반영에는 다음 조회까지 지연이 있다. 강사 연결이 15초 이상 끊기면 서버가 실습으로 바꾸고, 학생 앱은 별도의 watchdog을 통해 망 단절 시 해제한다.
+먼저 [아키텍처와 보안 경계](docs/architecture.ko.md)를 읽는다. 제어 상태는 인증된 WebSocket `GET /api/connect`으로 유지하며 서버는 연결 직후 현재 상태와 이후 명령 변경을 즉시 전달한다. 클라이언트는 5초마다 `heartbeat` 메시지를 보낸다. 강사는 mode·RTC 동작을 인증된 HTTPS endpoint로 보낸다. REST 상태·heartbeat 경로는 호환성·진단용으로만 남고 앱은 폴링하지 않는다. 강사 lease가 15초 이상 끊기면 서버가 실습으로 바꾸고, 학생 앱은 별도의 watchdog을 통해 망 단절 시 해제한다. Durable Object의 WebSocket hibernation은 인증 연결 정보를 보존하지만 유효한 강사 lease를 초기화하지 않는다. 새 강사 연결은 새 세션을 시작하기 전에 활성 명령을 안전하게 해제한다.
 
 앱과 백엔드 사이의 요청 형식은 [통신 규격](docs/protocol.ko.md)에 정리했다.
 
@@ -114,6 +114,7 @@ npm.cmd test --prefix backend
 npm.cmd run typecheck --prefix backend
 npm.cmd test --prefix apps
 npm.cmd run check --prefix apps
+node scripts/ws-smoke.mjs
 ```
 
 실제 수행 결과는 [검증 기록](docs/verification.ko.md)에 남긴다. 운영 전 [장비 검증표](docs/acceptance.ko.md)를 실행한다. 특히 Wi-Fi 단절, 강사 종료, 학생 프로세스 장애, 비상 해제를 1대에서 통과시킨 뒤 30대로 확장한다.
@@ -122,6 +123,6 @@ npm.cmd run check --prefix apps
 
 - 단일 강사·단일 교실 PoC다. 계정 관리 화면, 자동 등록 서버, 다중 강사 충돌 조정은 포함하지 않는다.
 - 화면 영상만 전달한다. 학생 화면 수집, 원격 마우스·키보드 조작, 파일 전송 기능은 없다.
-- 단순 상태 폴링이므로 순간적 명령 전달을 보장하지 않는다. 필요하면 WebSocket push로 발전시킬 수 있다.
-- 무료 사용 여부를 보장하지 않는다. SFU·TURN·Worker·Durable Objects 사용량 및 과금 알림을 계정에서 확인한다.
+- 상태는 연결된 WebSocket으로 전달한다. 실제 장비에서 송출·잠금·실습 전환의 즉시성을 확인한다.
+- 초기 목표는 Cloudflare 무료 플랜에서 학생 30대·5시간 1회다. 영상 payload 추정은 학생당 평균 1Mbps에서 67.5GB, 2Mbps에서 135GB, 4Mbps에서 270GB다. 재전송·프로토콜 오버헤드·TURN·계정의 다른 사용량은 포함하지 않는다. Realtime의 월간 SFU/TURN 합산 1,000GB 무료량 및 무료 플랜 동작은 변경될 수 있으므로, 비용 0원이나 지출 상한을 보장하지 말고 사용량을 확인한다.
 - 강사 재시작 후 과거 잠금으로 복구하지 않는다. 다시 화면을 선택해 송출한다.

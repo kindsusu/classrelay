@@ -24,7 +24,7 @@ describe("classroom safety policy", () => {
 describe("worker route boundary", () => {
   function classroomEnv() {
     const values = new Map<string, unknown>();
-    const state = { storage: { get: async <T>(key: string) => values.get(key) as T | undefined, put: async (key: string, value: unknown) => { values.set(key, value); } }, blockConcurrencyWhile: async (callback: () => Promise<void>) => callback() };
+    const state = { storage: { get: async <T>(key: string) => values.get(key) as T | undefined, put: async (key: string, value: unknown) => { values.set(key, value); }, setAlarm: async () => {} }, blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(), getWebSockets: () => [] };
     const object = new ClassroomState(state as never);
     return { ...env, CLASSROOM: { idFromName: () => "training", get: () => ({ fetch: (request: Request) => object.fetch(request) }) } } as never;
   }
@@ -36,6 +36,11 @@ describe("worker route boundary", () => {
   it("rejects protected routes before any state access", async () => {
     const response = await worker.fetch(new Request("https://classroom.example/api/state"), workerEnv);
     expect(response.status).toBe(401);
+  });
+  it("requires authentication and an Upgrade header for websocket connections", async () => {
+    expect((await worker.fetch(new Request("https://classroom.example/api/connect"), workerEnv)).status).toBe(401);
+    const response = await worker.fetch(new Request("https://classroom.example/api/connect", { headers: { Authorization: "Bearer controller" } }), workerEnv);
+    expect(response.status).toBe(426);
   });
   it("rejects an agent attempting to change classroom mode", async () => {
     const response = await worker.fetch(new Request("https://classroom.example/api/mode", { method: "POST", headers: { Authorization: "Bearer agent", "X-Device-Id": "pc-01" }, body: JSON.stringify({ mode: "practice" }) }), workerEnv);
@@ -49,12 +54,13 @@ describe("worker route boundary", () => {
     const response = await worker.fetch(new Request("https://classroom.example/api/rtc/sessions/x/tracks", { method: "PUT", headers: { Authorization: "Bearer controller" }, body: "{}" }), workerEnv);
     expect(response.status).toBe(405);
   });
-  it("resets a persisted lock to practice when a Durable Object starts", async () => {
+  it("preserves an unexpired persisted lock when a Durable Object wakes from hibernation", async () => {
     const values = new Map<string, unknown>([["snapshot", { revision: 2, mode: "lock", leaseMs: 15000, stream: { sessionId: "s", trackName: "t" }, students: [] }]]);
-    const state = { storage: { get: async <T>(key: string) => values.get(key) as T | undefined, put: async (key: string, value: unknown) => { values.set(key, value); } }, blockConcurrencyWhile: async (callback: () => Promise<void>) => callback() };
+    values.set("leaseUntil", Date.now() + 10_000);
+    const state = { storage: { get: async <T>(key: string) => values.get(key) as T | undefined, put: async (key: string, value: unknown) => { values.set(key, value); }, setAlarm: async () => {} }, blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(), getWebSockets: () => [] };
     const object = new ClassroomState(state as never);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const response = await object.fetch(new Request("https://state.internal/state"));
-    expect(await response.json()).toMatchObject({ revision: 3, mode: "practice", stream: null });
+    expect(await response.json()).toMatchObject({ revision: 2, mode: "lock", stream: { sessionId: "s", trackName: "t" } });
   });
 });

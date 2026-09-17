@@ -8,7 +8,7 @@ Screen broadcasting and classroom input control for company-owned Windows traini
 
 ClassRelay is a proof of concept for one instructor and approximately 30 student devices, including devices on different Wi-Fi networks. The instructor selects a screen to broadcast, presents it fullscreen on student laptops, and optionally suppresses input during instruction. Practice mode releases the student desktops.
 
-> **Status: PoC.** Local tests and build checks have passed. Live Cloudflare media delivery, actual Windows input suppression, login startup, and a 30-device, eight-hour session still need validation on training hardware. The desktop interface currently uses Korean; repository documentation is available in English and Korean.
+> **Status: PoC.** Live Cloudflare media delivery, actual Windows input suppression, login startup, and a 30-device, five-hour session still need validation on training hardware. The desktop interface currently uses Korean; repository documentation is available in English and Korean.
 
 ## Features
 
@@ -26,15 +26,16 @@ ClassRelay does not collect student screens, files, or keystrokes, and does not 
 
 ```mermaid
 flowchart LR
-  C[Windows Controller] -->|HTTPS commands and heartbeat| W[Cloudflare Worker]
-  A[Windows Agents] -->|HTTPS state polling| W
-  W --> D[Durable Object]
+  C[Windows Controller] <-->|Authenticated WebSocket: state + 5 s heartbeat| W[Cloudflare Worker]
+  A[Windows Agents] <-->|Authenticated WebSocket: state push + 5 s heartbeat| W
+  C -->|HTTPS mode / RTC actions| W
+  W --> D[One SQLite Durable Object / classroom]
   W -->|Authenticated SDP signaling| S[Realtime SFU]
   C -->|WebRTC screen video| S
   S -->|WebRTC screen video| A
 ```
 
-Control uses three-second polling. Practice mode takes effect on the next successful poll; it is not an instantaneous push notification. If the instructor lease expires, the backend resets the classroom to practice mode. Each Agent also releases its overlay and input guard when its local control lease expires. Restarting the backend does not restore an old lock.
+Control state uses an authenticated WebSocket at `GET /api/connect`. The Worker sends the current state immediately after connection and pushes every command change; each client sends a `heartbeat` message every five seconds. The Controller sends mode and RTC actions through authenticated HTTPS endpoints. REST state and heartbeat routes remain only for compatibility and diagnostics; the applications do not poll them. The Controller has a 15-second server lease, while every Agent independently releases its overlay and input guard when its local lease expires. Durable Object WebSocket hibernation preserves authenticated connection attachments; it does not reset a valid Controller lease. A new Controller connection safely releases an active command before it begins a new session. An expired or emergency-released revision cannot re-lock through reconnection.
 
 See [architecture and security boundaries](docs/architecture.md) and the [API protocol](docs/protocol.md).
 
@@ -144,6 +145,7 @@ npm.cmd test --prefix backend
 npm.cmd run typecheck --prefix backend
 npm.cmd test --prefix apps
 npm.cmd run check --prefix apps
+node scripts/ws-smoke.mjs
 ```
 
 The [verification record](docs/verification.md) distinguishes completed local checks from untested live behavior. Follow the [field acceptance checklist](docs/acceptance.md), progressing through 1, 3, 10, and 30 devices. Verify network loss, instructor shutdown, Agent failure, and emergency release before the full training session.
@@ -152,6 +154,6 @@ The [verification record](docs/verification.md) distinguishes completed local ch
 
 - One instructor and one classroom per deployment; no multi-instructor coordination or account-management UI.
 - Screen video only; no remote control, student screen collection, or file transfer.
-- Polling introduces command latency. WebSocket delivery can be added later.
-- Cloudflare usage is not guaranteed to be free. Monitor SFU, TURN, Workers, and Durable Objects usage.
+- State delivery depends on the active WebSocket and network conditions; test immediate broadcast, lock, and practice transitions on real devices.
+- The initial target is 30 students for one five-hour session on Cloudflare's free plan. Estimated video payload is 67.5 GB at 1 Mbps, 135 GB at 2 Mbps, or 270 GB at 4 Mbps. These figures exclude overhead, retransmission, TURN, and other account usage. Realtime's monthly 1,000 GB combined SFU/TURN allowance and free-plan behavior can change; monitor usage and do not treat this as a hard spend cap or a zero-cost guarantee.
 - After an instructor restart, select the screen and start broadcasting again. Old locks are not restored.

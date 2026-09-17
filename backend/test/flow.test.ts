@@ -5,13 +5,17 @@ afterEach(() => vi.unstubAllGlobals());
 
 async function fixture() {
   const values = new Map<string, unknown>();
+  let alarmAt: number | null = null;
+  const sockets: WebSocket[] = [];
   let ready: Promise<unknown> = Promise.resolve();
   const durable = new ClassroomState({
     storage: {
       get: async (key: string) => structuredClone(values.get(key)),
-      put: async (key: string, value: unknown) => { values.set(key, structuredClone(value)); }
+      put: async (key: string, value: unknown) => { values.set(key, structuredClone(value)); },
+      setAlarm: async (value: number) => { alarmAt = value; }
     },
-    blockConcurrencyWhile: (callback: () => Promise<unknown>) => { ready = callback(); return ready; }
+    blockConcurrencyWhile: (callback: () => Promise<unknown>) => { ready = callback(); return ready; },
+    getWebSockets: () => sockets
   } as never);
   await ready;
   const env = {
@@ -30,7 +34,7 @@ async function fixture() {
     return Response.json({ tracks: payload.tracks || [], sessionDescription: { type: 'answer', sdp: 'mock' } });
   });
   vi.stubGlobal('fetch', upstream);
-  return { values, request, upstream };
+  return { values, request, upstream, get alarmAt() { return alarmAt; } };
 }
 
 it('publishes, authorizes only the active track, isolates students, and clears expired control', async () => {

@@ -6,6 +6,8 @@ ClassRelay provides a Windows **Controller** for instructors and a Windows **Age
 
 The Controller publishes an instructor-selected display to Cloudflare Realtime SFU. The Agent subscribes to the authorized remote track and follows the classroom mode supplied by the backend. This PoC is designed for organization-owned training devices. It does not include remote control, student-screen collection, file collection, or keystroke logging.
 
+Both roles keep one authenticated WebSocket connection to `/api/connect`. The backend pushes the initial classroom state and subsequent changes; clients send a small heartbeat every five seconds instead of repeatedly polling state over HTTP. A connection that receives no state response for 15 seconds is discarded and reconnected with bounded exponential backoff. Credentials stay in the Electron main process and are sent as request headers, never in renderer code or the URL.
+
 ## Requirements
 
 - Windows 10 or later for the packaged application

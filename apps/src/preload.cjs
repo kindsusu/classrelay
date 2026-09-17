@@ -4,13 +4,12 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('classroom', Object.freeze({
   getConfig: () => ipcRenderer.invoke('config:get-public'),
+  stateReady: () => ipcRenderer.send('state:ready'),
   pulse: (mediaReady) => ipcRenderer.send('renderer:pulse', mediaReady === true),
   reportMediaFailure: () => ipcRenderer.send('agent:media-failed'),
   setStartup: (enabled) => ipcRenderer.invoke('startup:set', Boolean(enabled)),
   listCaptureSources: () => ipcRenderer.invoke('capture:list'),
   selectCaptureSource: (id) => ipcRenderer.invoke('capture:select', id),
-  getState: () => ipcRenderer.invoke('api:state'),
-  heartbeat: () => ipcRenderer.invoke('api:heartbeat'),
   setMode: (payload) => ipcRenderer.invoke('api:mode', payload),
   getIce: () => ipcRenderer.invoke('api:ice'),
   createRtcSession: (body) => ipcRenderer.invoke('rtc:session', body),
