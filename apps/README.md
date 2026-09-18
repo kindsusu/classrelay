@@ -81,7 +81,7 @@ Because a shared screen is usually slides or text, the Controller hints the enco
 
 ## Live media measurement
 
-While broadcasting, the Controller polls `RTCPeerConnection.getStats()` every two seconds and shows the measured outbound video line, for example `송출 1280×720 · 14fps · 1.8Mbps · 손실 0.1%`. Use these figures in place of estimated bit rates when sizing a class. The Agent polls inbound video every second and shows the received resolution, frame rate, and bit rate. Neither side logs SDP bodies, tokens, or credentials.
+While broadcasting, the Controller polls `RTCPeerConnection.getStats()` every two seconds and shows the measured outbound video line, for example `송출 1280×720 · 14fps · 1.8Mbps · 손실 0.1%`. Use these figures in place of estimated bit rates when sizing a class. The Agent still polls inbound video every second, but that poll now only feeds frozen-video detection; the measured line is no longer drawn on the student screen. Neither side logs SDP bodies, tokens, or credentials.
 
 The Controller counts control connections and video reception separately (`연결 학생` and `영상 N`), both using the same 15-second `lastSeen` cutoff. An attached control socket does not prove that device is receiving video, so the connection count alone must not be read as 30 successful video streams.
 
@@ -100,9 +100,39 @@ Every non-practice mode puts the Agent window into kiosk fullscreen, so the Wind
 
 **Kiosk is not an input lock.** It hides chrome; it does not stop keystrokes. In `broadcast` the student's input is deliberately left free, so a determined student can still press Alt+Tab or Win+Tab and leave the classroom view. Only `lecture` and `lock` ask the native helper to suppress input, and only on a device where `nativeInputLock` is enabled. With that option off — which is the default — both locking modes show their overlay but suppress nothing.
 
-`lecture` and `lock` differ only in what the student sees. `lecture` leaves the instructor's video fully visible and marks the locked state with a small strip at the top of the screen that also names the `Ctrl+Shift+F12` emergency release. `lock` covers the video with the obscuring shield and tells the student to look at the instructor in the room. Neither overlay is what makes a lock safe: the overlay is presentation only, while the actual suppression and every release path live in the main process and the native helper.
+`lecture` and `lock` differ only in what the student sees. `lecture` leaves the instructor's video completely unobstructed — no strip, no status text, no statistics. `lock` covers the video with the obscuring shield and tells the student to look at the instructor in the room. Neither overlay is what makes a lock safe: the overlay is presentation only, while the actual suppression and every release path live in the main process and the native helper.
 
 Pressing 실습 시작 also minimises the instructor window, so the instructor can use their own PC immediately. The other three modes leave the window up, because the instructor still has to drive the class. The window is minimised and never hidden, so the taskbar always leads back to it.
+
+## What the student screen shows
+
+A healthy non-practice mode shows the instructor's video and nothing else. The student overlay is empty and hidden, so the screen reads as presentation mode rather than as an application window with a status bar. It speaks only when something is actually broken, because the student and the on-site staff then have to know what happened and what is about to happen.
+
+| Condition | What the student sees |
+|---|---|
+| Control connection lost or reconnecting | the current locking mode, then `서버 재연결 중 · 15초 후 자동 해제` |
+| Subscription retry | the current locking mode, then `영상 재연결 시도 N/3` |
+| Subscription gave up | the current locking mode, then `영상 연결 실패 · 강사에게 알려주세요` |
+| Frozen-video safe release | `강사 화면 신호가 3초 이상 멈춰 입력 차단을 해제했습니다.` |
+| Emergency release, native-guard failure, or a quit request | the notice text sent by the main process |
+
+The first three name the mode, so staff can see that input is still locked while the video is missing. The two release lines do not, because the lock is already gone by then and a `입력 차단 중` prefix would tell the student something untrue. A release line outranks the others and stays for the revision it was raised in; only an instructor command with a newer revision clears it, which is the same rule that keeps a released revision from being re-locked.
+
+`#agent-empty` (`강사 화면을 기다리는 중`) is unchanged. It is the pre-stream placeholder, not a status overlay, and it still appears whenever no track is attached.
+
+**`lecture` no longer prints the `Ctrl+Shift+F12` hint on screen.** The shortcut itself works in every mode and is registered globally by the main process; only the on-screen reminder is gone, because a permanent text overlay is what the instructor asked us to remove. The `lock` shield still prints it, since that shield deliberately covers the video and the text obstructs nothing. Brief the on-site staff on the shortcut before the session, as the rollout plan requires — a student locked in `lecture` cannot read it off their own screen.
+
+## Switching the shared screen mid-class
+
+Clicking a different screen while broadcasting swaps the outgoing video track in place with `RTCRtpSender.replaceTrack()`. There is no renegotiation, no new SFU session, and no mode command, so the class revision does not change: switching screens cannot arm a lock, cannot release one, and cannot resurrect a revision that was already released. The publication's identity — its SFU session, track name, and activation revision — is untouched, so the students keep watching the same subscription throughout.
+
+The screen list marks two different things. A blue border is the screen the instructor has *selected*. A green border with the `송출 중` badge is the screen *actually going out right now*. They diverge while a switch is in flight and after a failed one, which is the point: the instructor can see whether the change landed instead of guessing. The four-button action grid is unchanged, and the Controller reports both success and failure on its message line.
+
+A failed switch leaves the previous screen broadcasting. If the capture request is refused, if the selected window has no video track, or if `replaceTrack` throws, the newly captured stream is stopped and the sender keeps the old track — the publication is never left with a sender that has no track at all. A control-socket reconnect that lands during a switch cancels it and stops the new capture rather than reviving the stale publication.
+
+The `ended` watcher that drops the class to practice when the instructor stops sharing from the OS share UI moves with the track. It is detached from the old track *before* that track is stopped and re-attached to the replacement first, so stopping the old capture during a switch is not mistaken for the instructor ending the share. Getting that order wrong would silently drop the whole class to practice on every screen change.
+
+The `video` block's capture caps and the `contentHint = "text"` legibility hint are applied to the replacement track as well, so a switch cannot slip past the bandwidth budget. Encoder parameters live on the sender rather than the track and survive the swap.
 
 ## Shutting down the student apps
 

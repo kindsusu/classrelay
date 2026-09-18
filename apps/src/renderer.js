@@ -14,10 +14,12 @@ const FREEZE_MS = 3_000;
 const RESUBSCRIBE_BACKOFF_MS = [1_000, 3_000, 6_000];
 const MAX_RESUBSCRIBE_ATTEMPTS = RESUBSCRIBE_BACKOFF_MS.length;
 const ROSTER_CUTOFF_MS = 15_000;
+const SWITCH_CANCELLED = '서버 연결이 바뀌어 화면 교체를 취소했습니다. 송출 상태를 확인하고 다시 시도하세요.';
 
 let config;
 let sources = [];
 let selectedSourceId = null;
+let sourceSwitching = false;
 let publishing = null;
 let subscribing = null;
 let lastStreamKey = null;
@@ -281,6 +283,7 @@ async function stopPublishing() {
   if (!publishing) return;
   const active = publishing;
   publishing = null;
+  markSources();
   stopPublishStats();
   if (active.endedHandler) active.track.removeEventListener('ended', active.endedHandler);
   active.stream.getTracks().forEach((track) => track.stop());
@@ -317,7 +320,9 @@ async function startPublishing() {
     const endedHandler = () => setPractice().catch(() => {});
     track.addEventListener('ended', endedHandler, { once: true });
     const descriptor = { sessionId: session.sessionId, trackName: result.tracks?.[0]?.trackName || trackName };
-    publishing = { pc, stream, track, endedHandler, descriptor, activationRevision: null };
+    // sender를 함께 들고 있어야 송출을 끊지 않고 replaceTrack으로 화면만 바꿀 수 있다.
+    publishing = { pc, stream, track, sender: transceiver.sender, endedHandler, descriptor, activationRevision: null, sourceId: selectedSourceId };
+    markSources();
     startPublishStats(publishing);
     pc.addEventListener('connectionstatechange', () => {
       if (pc.connectionState === 'failed' && publishing?.pc === pc) {
@@ -344,9 +349,57 @@ function plainDescription(description) {
   return { type: description.type, sdp: description.sdp };
 }
 
-function setAgentDetail(text) {
-  const el = $('agent-detail');
-  if (el) el.textContent = text || '';
+// 장애 문구에만 붙는 모드 접두사. 정상 상태에서는 어디에도 표시되지 않는다.
+const AGENT_STATUS = {
+  practice: '실습 모드',
+  broadcast: '화면 보여주기',
+  lecture: '이론 모드 · 입력 차단 중',
+  lock: '강사 주목 · 입력 차단 중'
+};
+
+const AGENT_OFFLINE_TEXT = '서버 재연결 중 · 15초 후 자동 해제';
+
+function agentStatusText(mode) {
+  return AGENT_STATUS[mode] || AGENT_STATUS.practice;
+}
+
+// 학생 화면은 발표 모드처럼 영상만 남긴다. 정상일 때는 모드 안내도 실측값도 올리지 않고,
+// 학생과 현장 담당자가 대응해야 하는 장애에서만 말한다: 제어 연결 끊김·재연결, 프리즈 안전 해제,
+// 구독 재시도·실패, 비상 해제. released는 그 revision 동안 latch되어 다른 문구에 밀리지 않는다.
+const agentAlert = { mode: 'practice', revision: -1, offline: false, subscribe: '', released: '' };
+
+// 해제·장애 문구는 그 revision 동안 유지한다. 같은 revision을 다시 받아도 지우지 않는다 —
+// 그러면 방금 왜 풀렸는지가 화면에서 사라진다. 더 큰 revision의 새 강사 명령만 화면을 다시 조용하게 한다.
+function alertClearedByRevision(alert, revision) {
+  return Number.isSafeInteger(revision) && Number.isSafeInteger(alert?.revision) && revision > alert.revision;
+}
+
+// 해제 문구에는 모드 접두사를 붙이지 않는다. 이미 잠금이 풀린 상태라 '입력 차단 중'을 덧붙이면
+// 학생에게 거짓을 말한다.
+function agentOverlayText(alert) {
+  if (alert?.released) return alert.released;
+  const fault = alert?.offline ? AGENT_OFFLINE_TEXT : alert?.subscribe || '';
+  if (!fault) return '';
+  return alert.mode && alert.mode !== 'practice' ? `${agentStatusText(alert.mode)} · ${fault}` : fault;
+}
+
+function renderAgentAlert() {
+  const el = $('agent-status');
+  if (!el) return;
+  const text = agentOverlayText(agentAlert);
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+}
+
+function latchAgentRelease(text) {
+  agentAlert.released = text || '';
+  agentAlert.subscribe = '';
+  renderAgentAlert();
+}
+
+function setAgentSubscribeAlert(text) {
+  agentAlert.subscribe = text || '';
+  renderAgentAlert();
 }
 
 function stopInboundStats() {
@@ -363,21 +416,18 @@ function declareFreeze(generation) {
   api.pulse(false);
   stopSubscription();
   api.reportMediaFailure();
-  $('agent-status').textContent = '강사 화면 신호가 멈춰 입력 차단을 해제했습니다.';
-  setAgentDetail(`영상 프레임이 ${FREEZE_MS / 1_000}초 이상 갱신되지 않았습니다. 강사의 새 명령을 기다립니다.`);
+  latchAgentRelease(`강사 화면 신호가 ${FREEZE_MS / 1_000}초 이상 멈춰 입력 차단을 해제했습니다. 강사의 새 명령을 기다립니다.`);
 }
 
+// 학생 쪽 수신 통계는 계속 읽지만 화면에는 올리지 않는다. 폴링의 목적은 표시가 아니라 프리즈 감지다.
 function startInboundStats(pc, generation) {
   stopInboundStats();
-  let previous = null;
   inboundStatsTimer = setInterval(async () => {
     if (generation !== subscriptionGeneration || subscribing !== pc) return stopInboundStats();
     let sample;
     try { sample = inboundVideoSample(collectStats(await pc.getStats()), performance.now()); }
     catch { return; }
     if (!sample || generation !== subscriptionGeneration || mediaFrozen) return;
-    setAgentDetail(formatMediaLine(previous, sample, 'bytesReceived'));
-    previous = sample;
     inboundProgress = evaluateVideoProgress(inboundProgress, sample);
     if (inboundProgress.frozen) declareFreeze(generation);
   }, INBOUND_STATS_MS);
@@ -393,11 +443,11 @@ function cancelResubscribe() {
 function scheduleResubscribe(reason) {
   if (resubscribeTimer) return;
   if (!shouldResubscribe(agentState, resubscribeAttempts)) {
-    $('agent-status').textContent = `영상 연결 실패 · 강사에게 알려주세요 (${reason})`;
+    setAgentSubscribeAlert(`영상 연결 실패 · 강사에게 알려주세요 (${reason})`);
     return;
   }
   const attempt = resubscribeAttempts + 1;
-  $('agent-status').textContent = `영상 재연결 시도 ${attempt}/${MAX_RESUBSCRIBE_ATTEMPTS}`;
+  setAgentSubscribeAlert(`영상 재연결 시도 ${attempt}/${MAX_RESUBSCRIBE_ATTEMPTS}`);
   resubscribeTimer = setTimeout(() => {
     resubscribeTimer = null;
     resubscribeAttempts = attempt;
@@ -425,7 +475,8 @@ function addRemoteTrack(streamInfo) {
       agentMediaReady = true;
       mediaFrozen = false;
       resubscribeAttempts = 0;
-      setAgentDetail('');
+      // 영상이 붙은 순간이 정상 상태다. 재시도 안내를 지워 학생 화면을 다시 조용하게 만든다.
+      setAgentSubscribeAlert('');
       api.pulse(true);
       startInboundStats(pc, generation);
     };
@@ -483,24 +534,115 @@ function stopSubscription() {
   $('agent-empty')?.classList.remove('hidden');
 }
 
+// 고른 화면(selected)과 지금 실제로 나가는 화면(live)은 다를 수 있다. 둘을 같은 표시로 묶으면
+// 강사가 교체가 끝났는지 알 수 없다.
+function sourceStateClass(sourceId, selectedId, liveId) {
+  return `source${sourceId === selectedId ? ' selected' : ''}${liveId && sourceId === liveId ? ' live' : ''}`;
+}
+
+function markSources() {
+  const live = publishing?.sourceId || null;
+  $('sources')?.querySelectorAll('.source').forEach((item) => {
+    item.className = sourceStateClass(item.dataset.sourceId, selectedSourceId, live);
+  });
+}
+
+function sourceSwitchMessage(name) {
+  return `송출 화면을 '${name}'(으)로 바꿨습니다. 수업 모드와 입력 잠금은 그대로입니다.`;
+}
+
+function publicationCancelled(publication, connectionGeneration) {
+  return publishing !== publication || !controllerOnline || connectionGeneration !== controllerConnectionGeneration;
+}
+
+// ended 리스너는 강사가 OS 공유 UI에서 공유를 끊었을 때 수업을 실습으로 내리는 장치다. 화면 교체로
+// 헌 트랙을 stop()하면 같은 ended가 발생하므로, 반드시 리스너를 새 트랙으로 옮긴 다음에만 헌 트랙을
+// 멈춘다. 순서가 뒤집히면 화면만 바꿨는데 수업 전체가 실습으로 풀린다.
+// descriptor와 activationRevision은 건드리지 않는다 — 발행 신분과 revision이 그대로여야
+// 화면 교체가 잠금을 다시 걸거나 해제된 잠금을 되살리지 못한다.
+function adoptPublishedTrack(publication, sourceId, stream, track) {
+  const previous = { stream: publication.stream, track: publication.track };
+  previous.track.removeEventListener('ended', publication.endedHandler);
+  track.addEventListener('ended', publication.endedHandler, { once: true });
+  publication.sourceId = sourceId;
+  publication.stream = stream;
+  publication.track = track;
+  previous.stream.getTracks().forEach((item) => item.stop());
+  return previous;
+}
+
+// 송출을 끊지 않고 sender의 트랙만 바꾼다. 재협상도 새 SFU 세션도 setMode도 없어 수업 revision이
+// 변하지 않는다. cancelled는 기본값으로 실제 취소 조건을 읽고, 테스트에서만 주입한다.
+async function replaceLiveTrack(publication, sourceId, cancelled = () => publicationCancelled(publication, controllerConnectionGeneration)) {
+  if (typeof publication?.sender?.replaceTrack !== 'function') {
+    throw new Error('이 실행 환경은 송출 중 화면 교체를 지원하지 않습니다. 실습 모드로 내린 뒤 다시 송출하세요.');
+  }
+  const video = videoConfig();
+  await api.selectCaptureSource(sourceId);
+  let stream;
+  try {
+    if (cancelled()) throw new Error(SWITCH_CANCELLED);
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { height: { max: video.maxHeight }, frameRate: { ideal: video.maxFps, max: video.maxFps } },
+      audio: false
+    });
+    const track = stream.getVideoTracks()[0];
+    if (!track) throw new Error('선택한 화면에서 영상 트랙을 얻지 못했습니다.');
+    await applyTrackCaps(track, video);
+    if (cancelled()) throw new Error(SWITCH_CANCELLED);
+    await publication.sender.replaceTrack(track);
+    // replaceTrack 뒤에도 한 번 더 확인한다. 그 사이 재연결이 stopPublishing()을 지나갔다면
+    // 헌 트랙은 이미 멈췄고 새 트랙만 남아 강사 화면을 계속 캡처하게 된다.
+    if (cancelled()) throw new Error(SWITCH_CANCELLED);
+    adoptPublishedTrack(publication, sourceId, stream, track);
+  } catch (error) {
+    // 교체 실패는 학생 화면을 끊지 않는다. 새로 딴 스트림만 버리고 sender는 헌 트랙을 계속 보낸다.
+    stream?.getTracks().forEach((item) => item.stop());
+    throw error;
+  }
+}
+
+async function switchLiveSource(sourceId, name) {
+  const publication = publishing;
+  if (!publication) throw new Error('송출 중이 아닙니다. 화면을 선택하고 송출 버튼을 누르세요.');
+  message('송출 화면을 바꾸고 있습니다…');
+  await replaceLiveTrack(publication, sourceId);
+  message(sourceSwitchMessage(name));
+}
+
+function selectSource(source) {
+  // 교체 중에는 선택도 받지 않는다. 받아 주면 아무 일도 하지 않은 클릭이 선택 표시만 옮겨
+  // 강사가 지금 무엇이 나가는지 헷갈리게 된다.
+  if (sourceSwitching) return;
+  selectedSourceId = source.id;
+  markSources();
+  if (!publishing || publishing.sourceId === source.id) return;
+  sourceSwitching = true;
+  withBusy(() => switchLiveSource(source.id, source.name)).finally(() => {
+    sourceSwitching = false;
+    markSources();
+  });
+}
+
 async function refreshSources() {
   const container = $('sources');
   container.replaceChildren();
   sources = await api.listCaptureSources();
+  const live = publishing?.sourceId || null;
   for (const source of sources) {
     const button = document.createElement('button');
-    button.className = `source${source.id === selectedSourceId ? ' selected' : ''}`;
+    button.dataset.sourceId = source.id;
+    button.className = sourceStateClass(source.id, selectedSourceId, live);
     const image = document.createElement('img');
     image.src = source.thumbnail;
     image.alt = '';
     const name = document.createElement('span');
     name.textContent = source.name;
-    button.append(image, name);
-    button.addEventListener('click', () => {
-      selectedSourceId = source.id;
-      container.querySelectorAll('.source').forEach((item) => item.classList.remove('selected'));
-      button.classList.add('selected');
-    });
+    const badge = document.createElement('em');
+    badge.className = 'live-badge';
+    badge.textContent = '송출 중';
+    button.append(image, name, badge);
+    button.addEventListener('click', () => selectSource(source));
     container.append(button);
   }
 }
@@ -647,24 +789,16 @@ async function initController() {
   await refreshSources();
 }
 
-const AGENT_STATUS = {
-  practice: '실습 모드',
-  broadcast: '강사 화면 송출 중',
-  lecture: '이론 모드 · 입력 차단 중 · 비상 해제 Ctrl+Shift+F12',
-  lock: '강사 주목 · 입력 차단 중 · 비상 해제 Ctrl+Shift+F12'
-};
-
-function agentStatusText(mode) {
-  return AGENT_STATUS[mode] || AGENT_STATUS.practice;
-}
-
-// lecture는 강사 화면을 가려서는 안 되므로 차단막을 띄우지 않고 상단 띠로만 알린다.
-// 실제 입력 차단은 이 오버레이가 아니라 main의 locksInput 경로와 네이티브 InputGuard가 한다.
+// lecture는 강사 화면을 가려서는 안 되므로 아무 오버레이도 띄우지 않는다. lock의 차단막은 설계상
+// 화면을 덮으므로 그 안의 비상 해제 안내는 가리는 것이 없다 — 단축키가 화면에 남는 유일한 모드다.
+// 실제 입력 차단은 오버레이가 아니라 main의 locksInput 경로와 네이티브 InputGuard가 한다.
 function renderAgentMode(command) {
   const locked = command.mode === 'lock';
   $('input-shield').classList.toggle('hidden', !locked);
-  $('lecture-note').classList.toggle('hidden', command.mode !== 'lecture');
-  $('agent-status').textContent = agentStatusText(command.mode);
+  if (alertClearedByRevision(agentAlert, command.revision)) latchAgentRelease('');
+  if (Number.isSafeInteger(command.revision)) agentAlert.revision = command.revision;
+  agentAlert.mode = command.mode;
+  renderAgentAlert();
   if (locked) $('input-shield').focus();
   if (command.mode === 'practice') stopSubscription();
 }
@@ -687,8 +821,8 @@ async function initAgent() {
   $('agent').classList.remove('hidden');
   api.onState(handleAgentState);
   api.onAgentMode(renderAgentMode);
-  api.onNotice((text) => { $('agent-status').textContent = text; stopSubscription(); });
-  api.onConnection((state) => { if (!state.online) $('agent-status').textContent = '서버 재연결 중 · 15초 후 자동 해제'; });
+  api.onNotice((text) => { latchAgentRelease(text); stopSubscription(); });
+  api.onConnection((state) => { agentAlert.offline = state.online !== true; renderAgentAlert(); });
   api.stateReady();
 }
 
@@ -723,9 +857,17 @@ if (typeof module !== 'undefined' && module.exports) {
     controllerModeLabel,
     commandMessage,
     agentStatusText,
+    agentOverlayText,
+    alertClearedByRevision,
     quitReportMessage,
+    sourceStateClass,
+    sourceSwitchMessage,
+    adoptPublishedTrack,
+    replaceLiveTrack,
     MODE_LABELS,
     AGENT_STATUS,
+    AGENT_OFFLINE_TEXT,
+    SWITCH_CANCELLED,
     FREEZE_MS,
     MAX_RESUBSCRIBE_ATTEMPTS,
     RESUBSCRIBE_BACKOFF_MS,

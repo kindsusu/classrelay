@@ -101,12 +101,16 @@ test('모르는 모드 이름은 실습 모드 표시로 되돌린다', () => {
   assert.equal(agentStatusText('unknown'), agentStatusText('practice'));
 });
 
-test('이론 모드와 강사 주목만 비상 해제 단축키를 학생에게 알린다', () => {
+// 모드 문구는 장애 안내의 접두사로만 쓰인다. 정상 상태에서는 어디에도 표시되지 않으므로
+// 학생 화면에 상주하던 단축키 안내도 함께 사라졌다 — 화면에 남는 곳은 lock 차단막뿐이다.
+test('잠금 모드 접두사는 입력 차단을 알리되 단축키는 담지 않는다', () => {
   const { agentStatusText, AGENT_STATUS } = loadRendererExports();
   assert.deepEqual(Object.keys(AGENT_STATUS).sort(), ['broadcast', 'lecture', 'lock', 'practice']);
   for (const mode of ['lecture', 'lock']) {
-    assert.ok(agentStatusText(mode).includes('Ctrl+Shift+F12'), `${mode} 안내에 단축키가 없다`);
-    assert.ok(agentStatusText(mode).includes('입력 차단'), `${mode} 안내에 입력 차단 표시가 없다`);
+    assert.ok(agentStatusText(mode).includes('입력 차단'), `${mode} 접두사에 입력 차단 표시가 없다`);
+  }
+  for (const mode of ['practice', 'broadcast', 'lecture', 'lock']) {
+    assert.equal(agentStatusText(mode).includes('F12'), false, `${mode} 접두사에 단축키가 남아 있다`);
   }
   assert.equal(agentStatusText('broadcast').includes('입력 차단'), false);
   assert.equal(agentStatusText('practice').includes('입력 차단'), false);
@@ -159,17 +163,16 @@ test('렌더러의 lock 비교는 차단막 표시 결정 하나뿐이다', () =
   assert.equal(direct.length, 1, `표시 결정 외의 lock 비교가 있다:\n${direct.join('\n')}`);
   assert.ok(direct[0].includes('const locked'));
   assert.ok(/input-shield'\)\.classList\.toggle\('hidden', !locked\)/.test(source), '차단막이 lock 전용으로 묶여 있지 않다');
-  assert.ok(/lecture-note'\)\.classList\.toggle\('hidden', command\.mode !== 'lecture'\)/.test(source), '이론 모드 안내 띠가 lecture에 묶여 있지 않다');
 });
 
-test('이론 모드는 차단막을 쓰지 않고 별도 안내 요소를 쓴다', () => {
+test('이론 모드는 차단막도 안내 띠도 쓰지 않는다', () => {
   const html = readSource('index.html');
-  assert.ok(html.includes('id="lecture-note"'), '이론 모드 안내 요소가 없다');
-  assert.ok(/id="lecture-note"[^>]*>[^<]*이론 모드[\s\S]*?Ctrl \+ Shift \+ F12/.test(html), '안내 띠에 모드 이름과 비상 해제 단축키가 없다');
+  assert.equal(html.includes('lecture-note'), false, '이론 모드 안내 띠가 남아 있다');
   const css = readSource('styles.css');
-  // 차단막만 화면을 흐린다. 안내 띠에 blur나 전면 덮기가 들어가면 이론 모드의 목적이 깨진다.
+  // 차단막만 화면을 흐린다. lock은 설계상 화면을 덮으므로 그 안의 안내는 가리는 것이 없다.
   assert.ok(/\.input-shield\{[^}]*backdrop-filter:blur/.test(css), '차단막의 흐림 처리가 사라졌다');
-  assert.equal(/\.lecture-note\{[^}]*(backdrop-filter|inset:0)/.test(css), false, '안내 띠가 화면을 덮는다');
+  assert.equal(css.includes('.lecture-note'), false, '안내 띠 CSS가 남아 있다');
+  assert.ok(/id="input-shield"[\s\S]*?Ctrl \+ Shift \+ F12/.test(html), 'lock 차단막에서 비상 해제 안내가 사라졌다');
 });
 
 test('에이전트 창은 실습이 아닌 모든 모드에서 kiosk로 작업 표시줄을 덮는다', () => {
