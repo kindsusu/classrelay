@@ -169,10 +169,26 @@ test('이론 모드는 차단막도 안내 띠도 쓰지 않는다', () => {
   const html = readSource('index.html');
   assert.equal(html.includes('lecture-note'), false, '이론 모드 안내 띠가 남아 있다');
   const css = readSource('styles.css');
-  // 차단막만 화면을 흐린다. lock은 설계상 화면을 덮으므로 그 안의 안내는 가리는 것이 없다.
+  // 차단막만 화면을 흐린다. lock은 설계상 화면을 덮지만, 그 안에도 비상 해제 단축키는 더 이상 없다 —
+  // 문제는 가림이 아니라 노출이었다.
   assert.ok(/\.input-shield\{[^}]*backdrop-filter:blur/.test(css), '차단막의 흐림 처리가 사라졌다');
   assert.equal(css.includes('.lecture-note'), false, '안내 띠 CSS가 남아 있다');
-  assert.ok(/id="input-shield"[\s\S]*?Ctrl \+ Shift \+ F12/.test(html), 'lock 차단막에서 비상 해제 안내가 사라졌다');
+  assert.equal(/id="input-shield"[\s\S]*?Ctrl \+ Shift \+ F12/.test(html), false, 'lock 차단막에 비상 해제 단축키 안내가 남아 있다');
+});
+
+// 단축키를 학생이 볼 수 있으면 전원이 잠금을 풀 수 있다 — 강사와 현장 담당자만 알아야 한다.
+// 표시를 지우는 동안 main.cjs의 실제 등록까지 함께 지워지는 회귀를 막기 위해 두 조건을 한 테스트에서 같이 본다.
+test('비상 해제 단축키는 학생 쪽 소스 어디에도 없고 main.cjs의 전역 등록은 그대로다', () => {
+  const html = readSource('index.html');
+  const css = readSource('styles.css');
+  const renderer = readSource('renderer.js');
+  for (const [name, source] of [['index.html', html], ['styles.css', css], ['renderer.js', renderer]]) {
+    assert.equal(source.includes('F12'), false, `${name}에 단축키 흔적(F12)이 남아 있다`);
+    assert.equal(source.includes('Ctrl + Shift'), false, `${name}에 단축키 흔적(띄어쓰기 표기)이 남아 있다`);
+    assert.equal(source.includes('Ctrl+Shift'), false, `${name}에 단축키 흔적(붙여쓰기 표기)이 남아 있다`);
+  }
+  const main = readSource('main.cjs');
+  assert.ok(main.includes("globalShortcut.register('CommandOrControl+Shift+F12'"), 'main.cjs의 전역 단축키 등록이 사라졌다 — fail-safe 능력이 없어졌다');
 });
 
 test('에이전트 창은 실습이 아닌 모든 모드에서 kiosk로 작업 표시줄을 덮는다', () => {

@@ -790,7 +790,8 @@ async function initController() {
 }
 
 // lecture는 강사 화면을 가려서는 안 되므로 아무 오버레이도 띄우지 않는다. lock의 차단막은 설계상
-// 화면을 덮으므로 그 안의 비상 해제 안내는 가리는 것이 없다 — 단축키가 화면에 남는 유일한 모드다.
+// 화면을 덮고 강의실의 강사를 보라고 안내하지만, 비상 해제 단축키는 어느 모드의 학생 화면에도
+// 적지 않는다 — 그 키는 강사와 현장 담당자만 알아야 새는 것을 막을 수 있다.
 // 실제 입력 차단은 오버레이가 아니라 main의 locksInput 경로와 네이티브 InputGuard가 한다.
 function renderAgentMode(command) {
   const locked = command.mode === 'lock';

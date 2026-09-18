@@ -96,12 +96,13 @@ test('해제 문구는 같은 revision 재수신으로 지워지지 않고 새 �
   assert.equal(alertClearedByRevision({}, 10), false);
 });
 
-test('이론 모드는 학생 화면에 비상 해제 단축키를 더 이상 띄우지 않는다', () => {
+test('이론 모드도 강사 주목도 학생 화면에 비상 해제 단축키를 띄우지 않는다', () => {
   const html = readSource('index.html');
   assert.equal(html.includes('lecture-note'), false, '안내 띠 요소가 남아 있다');
-  // lock 차단막은 설계상 화면을 덮으므로 그 안의 단축키는 아무것도 가리지 않는다.
-  assert.ok(/id="input-shield"[\s\S]*?Ctrl \+ Shift \+ F12/.test(html), 'lock 차단막의 단축키 안내가 사라졌다');
-  assert.equal((html.match(/Ctrl \+ Shift \+ F12/g) || []).length, 1, '단축키 안내가 lock 차단막 밖에도 있다');
+  // 단축키는 강사와 현장 담당자만 알아야 한다. lock 차단막이 화면을 덮더라도 노출해도 되는 이유는 아니므로
+  // 예외를 두지 않는다 — 두 표기 모두 학생 화면 어디에도 없어야 한다.
+  assert.equal((html.match(/Ctrl \+ Shift \+ F12/g) || []).length, 0, '단축키 안내(띄어쓰기 표기)가 학생 화면에 남아 있다');
+  assert.equal((html.match(/Ctrl\+Shift\+F12/g) || []).length, 0, '단축키 안내(붙여쓰기 표기)가 학생 화면에 남아 있다');
 });
 
 test('학생 화면에서 실측 통계 줄을 없애고 강사 화면에는 그대로 둔다', () => {
