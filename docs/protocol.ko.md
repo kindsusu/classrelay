@@ -59,11 +59,32 @@ roster의 각 항목은 `mediaReady`를 boolean으로 보고한다. 기기가 �
 | POST `/api/heartbeat` | 강사·학생 | 기존 호환성·진단용 presence/lease 갱신 |
 | POST `/api/mode` | 강사 | HTTPS 동작: `{mode, stream?}`으로 모드 변경 |
 | GET `/api/ice` | 강사·학생 | STUN 및 선택적 단기 TURN 자격증명 |
-| POST `/api/rtc/sessions` | 강사·학생 | SFU 세션 생성; 기본 body `{}` |
+| POST `/api/rtc/sessions` | 강사·학생 | SFU 세션 생성; body에 `{sessionDescription: {type: "offer", sdp}}`를 실어야 하고 응답이 answer를 돌려준다 |
 | POST `/api/rtc/sessions/:id/tracks` | 세션 소유자 | 강사는 local video publish, 학생은 active remote video subscribe |
 | PUT `/api/rtc/sessions/:id/renegotiate` | 세션 소유자 | `{sessionDescription: {type, sdp}}` 전달 |
 
 HTTPS mode·RTC endpoint는 동작 실행 API로 남고 결과 상태는 WebSocket으로 연결된 클라이언트에 전송한다. 영상은 WebSocket이나 HTTP 응답 body로 중계하지 않는다. SDP 협상 뒤 Controller→Cloudflare SFU→Agent WebRTC 경로로 전송한다.
+
+## RTC 협상 순서
+
+양쪽 역할 모두 세션 생성 시점에 offer를 보낸다. Controller는 캡처한 화면을 실은 `sendonly` video 트랜시버를, Agent는 offer로 내보낼 것이 있어야 하므로 `recvonly` video 트랜시버를 추가한다. 이어서 offer를 만들어 로컬에 적용하고 ICE 수집을 기다린 뒤 세션 생성 body로 보낸다.
+
+1. `POST /api/rtc/sessions`에 `{sessionDescription: {type: "offer", sdp}}` → `201 {sessionId, sessionDescription: {type: "answer", sdp}}`. 이 answer를 `setRemoteDescription`으로 적용한다.
+2. `POST /api/rtc/sessions/:id/tracks`에는 `{tracks: [...]}`만 보낸다. offer는 1단계에서 이미 전달되고 응답까지 받았다.
+3. 트랙 응답이 `sessionDescription`을 추가로 실어 오면 무시하지 않는다. `answer`는 로컬 offer가 아직 대기 중일 때만 적용하고, `offer`는 `PUT /api/rtc/sessions/:id/renegotiate`로 답한다. 1단계와 3단계 어디서도 remote description을 얻지 못하면 클라이언트는 성립할 수 없는 전송로를 기다리지 않고 한국어 오류로 실패시킨다.
+
+이 순서는 2026-09-18에 실제 controller token으로 배포된 Worker와 라이브 Cloudflare SFU를 측정해 확정했다.
+
+| 세션 생성 body | 라이브 결과 |
+|---|---|
+| `{}` | `400 {"errorCode":"decoding_error","errorDescription":"Body JSON validation error: sessionDescription"}` |
+| `{sessionDescription: {type: "offer", sdp}}` | `201 {sessionId, sessionDescription}`, `sessionDescription.type === "answer"` |
+
+**공개된 Cloudflare 스펙은 이와 다르며 낡았다.** `realtime-api-2024-05-21.yaml`과 Cloudflare 문서의 lifecycle 설명은 body 없는 `/sessions/new`와 `/tracks/new`로 나중에 보내는 offer를 적고 있다. 이 PoC가 원래 그대로 구현했고, 그래서 화면 송출이 매번 첫 호출에서 `서버 오류 400`만 남기고 실패했다. 위 측정을 공개 스펙보다 신뢰하고, 이 순서를 바꾸려면 먼저 다시 측정한다.
+
+**`/tracks/new` 규약은 실제 피어로 검증되지 않았다.** 이를 확인하려던 탐색은 DTLS fingerprint와 ICE candidate가 쓸 수 없는 합성 SDP를 썼다. SFU가 끝내 성립하지 않는 전송로를 기다렸고 Worker의 10초 업스트림 timeout이 먼저 걸려 `502 {"error":"Realtime service unavailable"}`가 돌아왔다 — SFU의 거절이 아니라 호출 측 산물이다. 따라서 `/tracks/new`가 `sessionDescription`을 요구하거나 반환하는지는 알 수 없다. 클라이언트는 최소 형태인 `{tracks: [...]}`만 보내고 응답에 SDP가 있든 없든 견딘다. 실제 두 대 송출 실행이 이를 확정할 것이다.
+
+SFU 오류 본문은 Worker 자신의 `error` 필드가 아니라 `errorCode`·`errorDescription`을 쓰며, Worker는 업스트림 RTC 실패의 상태 코드와 본문을 그대로 전달한다. `error`만 읽는 클라이언트는 실제 이유를 버리므로 `errorCode`·`errorDescription`을 함께 보여야 한다 — 길이를 제한하고, SDP나 자격증명처럼 보이는 문자열은 메시지·로그로 옮기지 않는다.
 
 SFU의 HTTP 성공 코드만 확인하지 않는다. 응답 전체와 개별 `tracks`의 `errorCode`도 실패로 처리한다. 학생의 원격 트랙 요청은 현재 상태의 `sessionId`·`trackName`과 일치해야 한다.
 

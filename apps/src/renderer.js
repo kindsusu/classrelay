@@ -216,6 +216,44 @@ async function applySenderCaps(sender, video) {
   }
 }
 
+// 라이브 SFU 실측(2026-09-18): /sessions/new는 offer를 요구하고 같은 응답에 answer를 돌려준다.
+// 빈 body({})는 400 decoding_error(Body JSON validation error: sessionDescription)로 거절된다.
+// 공개된 realtime-api-2024-05-21.yaml은 body 없는 세션 생성을 적고 있으나 낡았다.
+function sessionCreationBody(description) {
+  return { sessionDescription: plainDescription(description) };
+}
+
+// 트랙 요청은 최소 형태로 보낸다. offer는 세션 생성에서 이미 전달·응답됐고,
+// /tracks/new가 SDP를 또 요구하는지는 실기기 검증 전까지 확정되지 않았다.
+function localTrackRequest(mid, trackName) {
+  return { tracks: [{ location: 'local', kind: 'video', mid, trackName }] };
+}
+
+function remoteTrackRequest(streamInfo) {
+  return { tracks: [{ location: 'remote', sessionId: streamInfo.sessionId, trackName: streamInfo.trackName }] };
+}
+
+// 어느 응답이 SDP를 실어 줄지는 세션 생성만 측정으로 확정됐다. 트랙 응답이 SDP를 함께 주더라도
+// 무시하지 않는다. 이미 협상이 끝난 뒤 온 answer는 중복이라 버리고, offer는 renegotiate로 답한다.
+function negotiationStep(description, signalingState) {
+  if (!description || typeof description.type !== 'string' || typeof description.sdp !== 'string') return 'none';
+  if (description.type === 'answer') return signalingState === 'have-local-offer' ? 'answer' : 'none';
+  if (description.type === 'offer') return 'renegotiate';
+  return 'none';
+}
+
+async function applyNegotiation(pc, sessionId, description, action) {
+  const step = negotiationStep(description, pc.signalingState);
+  if (step === 'none') return step;
+  await pc.setRemoteDescription(description);
+  if (step === 'answer') return step;
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitIceComplete(pc);
+  assertRtc(await api.renegotiateRtc(sessionId, { sessionDescription: plainDescription(pc.localDescription) }), action);
+  return step;
+}
+
 function stopPublishStats() {
   if (publishStatsTimer) clearInterval(publishStatsTimer);
   publishStatsTimer = null;
@@ -270,13 +308,12 @@ async function startPublishing() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await waitIceComplete(pc);
-    const session = assertRtc(await api.createRtcSession({}), 'RTC 세션 생성');
+    const session = assertRtc(await api.createRtcSession(sessionCreationBody(pc.localDescription)), 'RTC 세션 생성');
     if (!session.sessionId) throw new Error('Cloudflare RTC 세션 ID를 받지 못했습니다.');
-    const result = assertRtc(await api.addRtcTracks(session.sessionId, {
-      tracks: [{ location: 'local', kind: 'video', mid: transceiver.mid, trackName }],
-      sessionDescription: plainDescription(pc.localDescription)
-    }), '화면 트랙 발행');
-    if (result.sessionDescription) await pc.setRemoteDescription(result.sessionDescription);
+    const sessionStep = await applyNegotiation(pc, session.sessionId, session.sessionDescription, 'RTC 세션 SDP 확정');
+    const result = assertRtc(await api.addRtcTracks(session.sessionId, localTrackRequest(transceiver.mid, trackName)), '화면 트랙 발행');
+    const trackStep = await applyNegotiation(pc, session.sessionId, result.sessionDescription, '화면 트랙 SDP 확정');
+    if (sessionStep === 'none' && trackStep === 'none') throw new Error('Cloudflare가 송출 응답 SDP를 반환하지 않았습니다.');
     const endedHandler = () => setPractice().catch(() => {});
     track.addEventListener('ended', endedHandler, { once: true });
     const descriptor = { sessionId: session.sessionId, trackName: result.tracks?.[0]?.trackName || trackName };
@@ -393,18 +430,22 @@ function addRemoteTrack(streamInfo) {
       startInboundStats(pc, generation);
     };
     try {
-      const session = assertRtc(await api.createRtcSession({}), '수신 RTC 세션 생성');
-      if (generation !== subscriptionGeneration) return pc.close();
-      const result = assertRtc(await api.addRtcTracks(session.sessionId, {
-        tracks: [{ location: 'remote', sessionId: streamInfo.sessionId, trackName: streamInfo.trackName }]
-      }), '원격 트랙 구독');
-      if (!result.sessionDescription) throw new Error('Cloudflare가 수신 SDP를 반환하지 않았습니다.');
-      await pc.setRemoteDescription(result.sessionDescription);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+      // 학생도 세션 생성 시점에 offer를 내야 한다. 받기만 하는 쪽이라 recvonly 트랜시버로 offer를 만든다.
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
       await waitIceComplete(pc);
       if (generation !== subscriptionGeneration) return pc.close();
-      assertRtc(await api.renegotiateRtc(session.sessionId, { sessionDescription: plainDescription(pc.localDescription) }), '수신 SDP 확정');
+      const session = assertRtc(await api.createRtcSession(sessionCreationBody(pc.localDescription)), '수신 RTC 세션 생성');
+      if (!session.sessionId) throw new Error('Cloudflare RTC 세션 ID를 받지 못했습니다.');
+      if (generation !== subscriptionGeneration) return pc.close();
+      const sessionStep = await applyNegotiation(pc, session.sessionId, session.sessionDescription, '수신 세션 SDP 확정');
+      if (generation !== subscriptionGeneration) return pc.close();
+      const result = assertRtc(await api.addRtcTracks(session.sessionId, remoteTrackRequest(streamInfo)), '원격 트랙 구독');
+      if (generation !== subscriptionGeneration) return pc.close();
+      const trackStep = await applyNegotiation(pc, session.sessionId, result.sessionDescription, '수신 SDP 확정');
+      if (generation !== subscriptionGeneration) return pc.close();
+      if (sessionStep === 'none' && trackStep === 'none') throw new Error('Cloudflare가 수신 SDP를 반환하지 않았습니다.');
       lastStreamKey = key;
       pc.addEventListener('connectionstatechange', () => {
         if (pc.connectionState === 'failed' && generation === subscriptionGeneration) {
@@ -610,6 +651,11 @@ if (typeof module !== 'undefined' && module.exports) {
     summarizeRoster,
     shouldResubscribe,
     normalizeIceServers,
+    plainDescription,
+    sessionCreationBody,
+    localTrackRequest,
+    remoteTrackRequest,
+    negotiationStep,
     videoProgressValue,
     evaluateVideoProgress,
     outboundVideoSample,

@@ -59,11 +59,32 @@ Each roster entry reports `mediaReady` as a boolean. It is `false` from the mome
 | POST `/api/heartbeat` | Instructor and student | Legacy compatibility and diagnostic presence/lease update |
 | POST `/api/mode` | Instructor | HTTPS action: change mode with `{mode, stream?}` |
 | GET `/api/ice` | Instructor and student | STUN and optional short-lived TURN credentials |
-| POST `/api/rtc/sessions` | Instructor and student | Create an SFU session; default body is `{}` |
+| POST `/api/rtc/sessions` | Instructor and student | Create an SFU session; the body must carry `{sessionDescription: {type: "offer", sdp}}` and the response returns the answer |
 | POST `/api/rtc/sessions/:id/tracks` | Session owner | Instructor publishes local video; student subscribes to active remote video |
 | PUT `/api/rtc/sessions/:id/renegotiate` | Session owner | Forward `{sessionDescription: {type, sdp}}` |
 
 The HTTPS mode and RTC endpoints remain the action API; the resulting state is pushed to connected clients over WebSocket. Video is not relayed in a WebSocket or HTTP response body. After SDP negotiation, it travels over WebRTC through Controller → Cloudflare SFU → Agent.
+
+## RTC negotiation order
+
+Both roles offer at session creation. The Controller adds a `sendonly` video transceiver for the captured display; the Agent adds a `recvonly` video transceiver so it has something to offer. Each then creates the offer, sets it locally, waits for ICE gathering, and sends it as the session-creation body:
+
+1. `POST /api/rtc/sessions` with `{sessionDescription: {type: "offer", sdp}}` → `201 {sessionId, sessionDescription: {type: "answer", sdp}}`. Apply that answer with `setRemoteDescription`.
+2. `POST /api/rtc/sessions/:id/tracks` with `{tracks: [...]}` only. The offer was already delivered and answered in step 1.
+3. If a track response carries a further `sessionDescription`, it is not ignored. An `answer` is applied only while the local offer is still pending, and an `offer` is answered through `PUT /api/rtc/sessions/:id/renegotiate`. If neither step 1 nor step 3 produced a remote description, the client fails the attempt in Korean rather than waiting on a transport that can never establish.
+
+This order was established by measuring the live deployed Worker against the live Cloudflare SFU on 2026-09-18 with a real controller token:
+
+| Session-creation body | Live result |
+|---|---|
+| `{}` | `400 {"errorCode":"decoding_error","errorDescription":"Body JSON validation error: sessionDescription"}` |
+| `{sessionDescription: {type: "offer", sdp}}` | `201 {sessionId, sessionDescription}` with `sessionDescription.type === "answer"` |
+
+**The published Cloudflare specification disagrees and is stale.** `realtime-api-2024-05-21.yaml` and the Cloudflare lifecycle documentation describe a body-less `/sessions/new` with the offer sent later to `/tracks/new`. That is what this PoC originally implemented, which is why screen broadcast failed at the first call every time with a bare `서버 오류 400`. Trust the measurements above over the published spec, and re-measure before changing this order.
+
+**The `/tracks/new` contract is not verified against a real peer.** The probe that would have settled it used a synthetic SDP with an unusable DTLS fingerprint and ICE candidates, so the SFU waited on a transport that never established and the Worker's own 10-second upstream timeout returned `502 {"error":"Realtime service unavailable"}` — a client-side artifact, not an SFU rejection. Whether `/tracks/new` also requires or returns a `sessionDescription` is therefore unknown; the client sends the minimal `{tracks: [...]}` request and tolerates a response with or without one. A real two-machine broadcast run is what will settle it.
+
+An SFU error body uses `errorCode` and `errorDescription`, not the Worker's own `error` field, and the Worker forwards an upstream RTC failure status and body unchanged. A client that reads only `error` discards the actual reason, so clients must surface `errorCode` and `errorDescription` — bounded in length, never carrying SDP or credential-shaped strings into a message or log.
 
 Do not rely only on an SFU HTTP success code. Treat errors in the complete response and each `tracks` `errorCode` as failures. A student's remote-track request must match the current state's `sessionId` and `trackName`.
 

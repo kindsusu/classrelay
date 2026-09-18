@@ -45,6 +45,30 @@ function resolveVideoConfig(raw) {
   return resolved;
 }
 
+const API_ERROR_MAX = 160;
+// SDP 특징 줄. 오류 본문이 SDP를 되돌려주더라도 UI·메시지 줄로 새어 나가면 안 된다.
+const SDP_MARKER = /\bv=0\b|\bo=[-\w]+ \d|\bm=(?:video|audio|application)\b|\ba=(?:fingerprint|ice-ufrag|ice-pwd|candidate|setup|mid|rtpmap)\b/i;
+// 32자 이상 이어지는 불투명 토큰(키·자격증명 후보)은 값을 보여주지 않는다.
+const OPAQUE_RUN = /[A-Za-z0-9+/=_-]{32,}/g;
+
+function apiErrorDetail(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (!text || SDP_MARKER.test(text)) return null;
+  const masked = text.replace(OPAQUE_RUN, '[생략]');
+  return masked.length > API_ERROR_MAX ? `${masked.slice(0, API_ERROR_MAX)}…` : masked;
+}
+
+// SFU 오류 본문은 error가 아니라 errorCode/errorDescription을 쓴다. error만 읽으면 400의 실제
+// 이유(decoding_error 등)가 사라져 운영자가 원인을 볼 수 없다. 대신 업스트림 본문을 그대로
+// 흘리지 않도록 알려진 필드만, 길이를 제한해, SDP·자격증명 후보를 지운 뒤 붙인다.
+function describeApiError(status, body) {
+  const detail = [apiErrorDetail(body?.errorCode), apiErrorDetail(body?.errorDescription) || apiErrorDetail(body?.error)]
+    .filter((part) => part)
+    .join(': ');
+  return detail ? `서버 오류 ${status} · ${detail}` : `서버 오류 ${status}`;
+}
+
 function readConfig() {
   const configPath = process.env.CLASSROOM_CONFIG
     ? path.resolve(process.env.CLASSROOM_CONFIG)
@@ -89,7 +113,7 @@ async function api(pathname, options = {}) {
   if (text) {
     try { body = JSON.parse(text); } catch { body = { error: text }; }
   }
-  if (!response.ok) throw new Error(body?.error || `서버 오류 ${response.status}`);
+  if (!response.ok) throw new Error(describeApiError(response.status, body));
   return body;
 }
 
@@ -303,7 +327,12 @@ function registerIpc() {
     return api('/api/mode', { method: 'POST', body: JSON.stringify(body) });
   });
   ipcMain.handle('api:ice', () => api('/api/ice'));
-  ipcMain.handle('rtc:session', (_event, body = {}) => api('/api/rtc/sessions', { method: 'POST', body: JSON.stringify(body) }));
+  ipcMain.handle('rtc:session', (_event, body) => {
+    // 라이브 SFU는 세션 생성에서 offer를 요구한다. 빈 body는 업스트림 400으로만 끝나므로 여기서 막는다.
+    const description = body?.sessionDescription;
+    if (typeof description?.type !== 'string' || typeof description?.sdp !== 'string') throw new Error('RTC 세션 생성 요청에 SDP가 없습니다.');
+    return api('/api/rtc/sessions', { method: 'POST', body: JSON.stringify(body) });
+  });
   ipcMain.handle('rtc:tracks', (_event, sessionId, body) => {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId || '') || !body || !Array.isArray(body.tracks)) throw new Error('잘못된 RTC 요청입니다.');
     return api(`/api/rtc/sessions/${encodeURIComponent(sessionId)}/tracks`, { method: 'POST', body: JSON.stringify(body) });
@@ -352,4 +381,4 @@ app.on('before-quit', () => {
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => { if (config?.role !== 'agent') app.quit(); });
 
-module.exports = { resolveVideoConfig, VIDEO_DEFAULTS, VIDEO_RANGES };
+module.exports = { resolveVideoConfig, VIDEO_DEFAULTS, VIDEO_RANGES, describeApiError, API_ERROR_MAX };
