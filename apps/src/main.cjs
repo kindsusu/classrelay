@@ -23,6 +23,7 @@ let inputGuardBuffer = '';
 let lastRendererPulse = 0;
 let rendererMediaReady = false;
 let nativeGuardUnavailable = false;
+let appliedAgentMode = null;
 const safety = new SafetyState();
 
 const VIDEO_DEFAULTS = Object.freeze({ maxHeight: 720, maxFps: 15, maxBitrateKbps: 2_000 });
@@ -200,22 +201,51 @@ function startInputGuard() {
   });
 }
 
+// 창의 실제 상태를 읽는다. 창이 사라졌거나 질의가 실패하면 null을 돌려주고, 호출처는 null을
+// "이미 맞다"로 읽지 않는다 — 모르면 다시 적용한다. 창 상태에 대한 잘못된 믿음으로 학생 화면이
+// 어긋난 채 남는 쪽이, 같은 값을 한 번 더 쓰는 쪽보다 나쁘다.
+function agentWindowFlag(name) {
+  if (!mainWindow || mainWindow.isDestroyed() || typeof mainWindow[name] !== 'function') return null;
+  try {
+    const value = mainWindow[name]();
+    return typeof value === 'boolean' ? value : null;
+  } catch { return null; }
+}
+
+// 하트비트는 5초마다 나가고 Durable Object는 그때마다 state 프레임을 돌려준다. safety.accept()는
+// 같은 revision도 받아들이므로(lease 갱신이 15초 워치독의 근거다) 이 함수는 수업 내내 5초마다
+// 다시 불린다. 그래서 원하는 상태와 창의 실제 상태를 비교해 다른 속성만 적용한다 — 반복 조작이
+// 학생 화면의 깜빡임이고, 반복 focus()는 입력을 일부러 풀어 둔 broadcast에서 다른 창을 쓰던
+// 학생을 5초마다 끌어낸다. 비교 기준이 실제 창 상태이므로 OS가 kiosk나 항상 위를 떨어뜨렸거나
+// 창이 최소화됐더라도 다음 state에서 스스로 복구된다.
 function applyAgentWindow() {
   if (config.role !== 'agent' || !mainWindow || mainWindow.isDestroyed()) return;
   const mode = safety.effectiveMode();
+  const modeChanged = appliedAgentMode !== mode;
+  appliedAgentMode = mode;
   if (mode === 'practice') {
+    // 해제 경로에는 조건을 걸지 않는다. 학생을 풀어 주는 절반이 이 세 줄이고, 창 상태를 잘못
+    // 알고 건너뛰면 학생이 kiosk에 갇힌 채 남는다. 실습은 항상 전부 실행한다.
     mainWindow.setKiosk(false);
     mainWindow.setAlwaysOnTop(false);
     mainWindow.hide();
   } else {
-    mainWindow.show();
-    mainWindow.setFullScreen(true);
-    mainWindow.setAlwaysOnTop(true, 'screen-saver');
-    // 비실습 모드는 전부 발표 모드처럼 작업 표시줄까지 덮는다. kiosk는 창 크롬을 가릴 뿐
-    // 입력 잠금이 아니다. 실제 입력 차단은 locksInput(mode)와 네이티브 InputGuard가 담당한다.
-    mainWindow.setKiosk(true);
-    mainWindow.focus();
+    // show()는 포커스까지 준다. 최소화된 창은 Windows에서 isVisible()이 false이므로 학생이
+    // 창을 내려도 이 한 줄로 되돌아온다.
+    if (agentWindowFlag('isVisible') !== true) mainWindow.show();
+    // isAlwaysOnTop()은 수준(screen-saver)까지 알려주지 않지만 이 값을 세우는 곳은 여기뿐이다.
+    if (agentWindowFlag('isAlwaysOnTop') !== true) mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    // 비실습 모드는 전부 발표 모드처럼 작업 표시줄까지 덮는다. Windows에서 kiosk는 전체화면
+    // 전환 그 자체다(NativeWindowViews::SetKiosk → SetFullScreen, IsKiosk → IsFullscreen).
+    // 그래서 setFullScreen(true)를 앞에 두면 한 번의 반영에서 전환이 두 번 일어나 번쩍이고,
+    // 전체화면 여부는 isKiosk() 하나로 판정하면 된다. kiosk는 창 크롬을 가릴 뿐 입력 잠금이
+    // 아니다. 실제 입력 차단은 locksInput(mode)와 네이티브 InputGuard가 담당한다.
+    if (agentWindowFlag('isKiosk') !== true) mainWindow.setKiosk(true);
+    // 포커스는 실제 모드 전환에서만 가져온다. 같은 모드가 다시 왔을 때도 부르면 그게 포커스 강탈이다.
+    if (modeChanged) mainWindow.focus();
   }
+  // 창 조작만 조건부가 된다. 렌더러의 renderAgentMode는 멱등이고 차단막·표시를 일관되게
+  // 유지하는 경로이기도 하므로, accept된 상태마다 예외 없이 보낸다.
   send('agent:mode', { mode, revision: safety.revision });
 }
 

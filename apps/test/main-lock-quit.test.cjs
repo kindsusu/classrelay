@@ -2,162 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const vm = require('node:vm');
-
-const SRC = path.join(__dirname, '..', 'src');
-const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'classrelay-test-'));
-process.on('exit', () => { try { fs.rmSync(TEMP_ROOT, { recursive: true, force: true }); } catch { /* 임시 폴더 정리 실패는 무시 */ } });
-let harnessSeq = 0;
-
-// main.cjs를 실제 whenReady 경로까지 태우는 하네스. 네이티브 InputGuard는 절대 실행하지 않는다 —
-// spawn은 가짜 프로세스를 돌려주고, 이 파일이 기록하는 LOCK/UNLOCK은 개발 PC 입력에 닿지 않는다.
-function bootMain(overrides = {}) {
-  harnessSeq += 1;
-  const dir = path.join(TEMP_ROOT, `boot-${harnessSeq}`);
-  fs.mkdirSync(dir, { recursive: true });
-  const configPath = path.join(dir, 'config.json');
-  fs.writeFileSync(configPath, JSON.stringify({
-    role: 'agent',
-    backendUrl: 'https://relay.example.invalid',
-    token: 'test-token-value',
-    deviceId: 'student-01',
-    nativeInputLock: true,
-    ...overrides
-  }));
-
-  const guardWrites = [];
-  const windowCalls = [];
-  const sent = [];
-  const fetchCalls = [];
-  const appEvents = new Map();
-  const ipcHandlers = new Map();
-  const ipcListeners = new Map();
-  let shortcut;
-  let tick;
-  let socketOptions;
-  let guardEnded = false;
-  let quitCount = 0;
-  let clock = 1_000;
-
-  const guard = {
-    stdin: {
-      writable: true,
-      write: (line) => guardWrites.push(line.trim()),
-      end: () => { guardEnded = true; guard.stdin.writable = false; },
-      on: () => {}
-    },
-    stdout: { setEncoding: () => {}, on: () => {} },
-    stderr: { on: () => {} },
-    on: () => {}
-  };
-
-  class FakeWindow {
-    constructor() {
-      this.webContents = { on: () => {}, send: (channel, value) => sent.push([channel, value]), setWindowOpenHandler: () => {} };
-    }
-    isDestroyed() { return false; }
-    loadFile() {}
-    on() {}
-    show() { windowCalls.push('show'); }
-    hide() { windowCalls.push('hide'); }
-    focus() {}
-    minimize() { windowCalls.push('minimize'); }
-    setFullScreen(value) { windowCalls.push(`fullScreen:${value}`); }
-    setKiosk(value) { windowCalls.push(`kiosk:${value}`); }
-    setAlwaysOnTop(value) { windowCalls.push(`alwaysOnTop:${value}`); }
-  }
-
-  const electron = {
-    app: {
-      whenReady: () => ({ then: (callback) => { callback(); return { then: () => {} }; } }),
-      on: (event, handler) => appEvents.set(event, handler),
-      getPath: () => dir,
-      getAppPath: () => dir,
-      getLoginItemSettings: () => ({ openAtLogin: false }),
-      setLoginItemSettings: () => {},
-      isPackaged: false,
-      quit: () => { quitCount += 1; }
-    },
-    BrowserWindow: FakeWindow,
-    desktopCapturer: { getSources: async () => [] },
-    dialog: { showErrorBox: () => { throw new Error('테스트에서 오류 대화상자가 떴다'); } },
-    globalShortcut: { register: (_accel, handler) => { shortcut = handler; }, unregisterAll: () => {} },
-    ipcMain: {
-      handle: (channel, handler) => ipcHandlers.set(channel, handler),
-      on: (channel, handler) => ipcListeners.set(channel, handler)
-    },
-    session: { defaultSession: { setDisplayMediaRequestHandler: () => {} } }
-  };
-
-  const stubs = {
-    electron,
-    // InputGuard.exe가 없는 환경에서도 같은 경로를 타도록 존재 검사만 고정한다.
-    'node:fs': { ...fs, existsSync: (target) => (String(target).endsWith('InputGuard.exe') ? true : fs.existsSync(target)) },
-    'node:path': path,
-    'node:child_process': { spawn: () => guard },
-    ws: class WebSocketStub {},
-    './safety.cjs': require('../src/safety.cjs'),
-    './control-socket.cjs': {
-      ControlSocket: class {
-        constructor(options) { socketOptions = options; this.stopped = false; }
-        start() {}
-        stop() { this.stopped = true; }
-      }
-    }
-  };
-
-  const moduleStub = { exports: {} };
-  const context = {
-    module: moduleStub,
-    __dirname: SRC,
-    require: (name) => {
-      if (name in stubs) return stubs[name];
-      throw new Error(`예상하지 못한 require: ${name}`);
-    },
-    process: { ...process, platform: 'win32', env: { ...process.env, CLASSROOM_CONFIG: configPath } },
-    console,
-    performance: { now: () => clock },
-    URL,
-    AbortController,
-    fetch: async (url, options) => {
-      fetchCalls.push({ url, method: options?.method, body: options?.body });
-      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, notified: 27, revision: 5 }) };
-    },
-    setInterval: (callback) => { tick = callback; return 0; },
-    clearInterval: () => {},
-    setTimeout,
-    clearTimeout
-  };
-  vm.runInNewContext(fs.readFileSync(path.join(SRC, 'main.cjs'), 'utf8'), context, { filename: 'main.cjs' });
-
-  return {
-    exports: moduleStub.exports,
-    guardWrites,
-    windowCalls,
-    sent,
-    fetchCalls,
-    tick: () => tick(),
-    state: (snapshot) => socketOptions.onState(snapshot),
-    quitCommand: () => socketOptions.onQuit(),
-    emergency: () => shortcut(),
-    beforeQuit: () => appEvents.get('before-quit')(),
-    pulse: (mediaReady) => ipcListeners.get('renderer:pulse')({}, mediaReady),
-    invoke: (channel, ...args) => ipcHandlers.get(channel)({}, ...args),
-    listen: (channel, ...args) => ipcListeners.get(channel)({}, ...args),
-    advance: (ms) => { clock += ms; },
-    quitCount: () => quitCount,
-    guardEnded: () => guardEnded,
-    socketOptions: () => socketOptions
-  };
-}
-
-function live(harness, mode, revision = 1) {
-  harness.pulse(true);
-  harness.state({ revision, mode, leaseMs: 15_000 });
-}
+const { bootMain, live } = require('./boot-main.cjs');
 
 test('이론 모드도 강사 주목과 똑같이 네이티브 잠금을 갱신한다', () => {
   for (const mode of ['lecture', 'lock']) {
@@ -175,12 +20,15 @@ test('화면 보여주기는 입력을 잠그지 않는다', () => {
   assert.equal(harness.guardWrites.at(-1), 'UNLOCK');
 });
 
+// 작업 표시줄을 덮는 것은 kiosk 하나로 끝난다. Windows에서 kiosk 진입이 곧 전체화면 전환이므로
+// setFullScreen(true)를 따로 부르면 한 번의 반영에서 전환이 두 번 일어난다(학생 화면 번쩍임).
 test('비실습 모드는 모두 kiosk로 작업 표시줄까지 덮는다', () => {
   for (const mode of ['broadcast', 'lecture', 'lock']) {
     const harness = bootMain();
     live(harness, mode, 3);
     assert.ok(harness.windowCalls.includes('kiosk:true'), `${mode}에서 kiosk를 켜지 않았다`);
-    assert.ok(harness.windowCalls.includes('fullScreen:true'), `${mode}에서 전체화면이 아니다`);
+    assert.equal(harness.window().fullScreen, true, `${mode}에서 전체화면이 아니다`);
+    assert.equal(harness.windowCalls.includes('fullScreen:true'), false, `${mode}에서 전체화면 전환을 두 번 했다`);
     assert.ok(harness.windowCalls.includes('alwaysOnTop:true'));
   }
 });
