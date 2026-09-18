@@ -11,7 +11,7 @@ Both roles keep one authenticated WebSocket connection to `/api/connect`. The ba
 ## Requirements
 
 - Windows 10 or later for the packaged application
-- Node.js 22 or later for local development
+- Node.js 24 LTS for local development, matching CI
 - A deployed ClassRelay backend and unique controller or agent credentials
 - The native input helper built at `../native-input/dist/InputGuard.exe` before packaging (bundled even when input suppression is disabled)
 

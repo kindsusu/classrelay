@@ -11,7 +11,7 @@ Controller는 강사가 선택한 화면을 Cloudflare Realtime SFU에 송출합
 ## 요구 사항
 
 - 패키지 앱 실행용 Windows 10 이상
-- 로컬 개발용 Node.js 22 이상
+- 로컬 개발용 Node.js 24 LTS — CI와 동일한 버전
 - 배포된 ClassRelay 백엔드와 Controller 또는 Agent별 고유 자격증명
 - 패키징 전에 빌드해야 하는 `../native-input/dist/InputGuard.exe` (입력 억제 설정과 관계없이 패키지에 포함)
 

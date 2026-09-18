@@ -2,40 +2,74 @@
 
 [한국어](verification.ko.md)
 
-Performed in a Windows development environment on 2026-09-17.
+## What "verified" means here
 
-## WebSocket control update
+This record separates three different things that are easy to blur together:
 
-The desktop clients now use authenticated WebSockets for state push and five-second heartbeats. REST mode and RTC operations remain action-based. No live Cloudflare resources or paid subscriptions were changed.
+- **Measured against the live deployment** — a real request was sent to the deployed Worker and the response was read.
+- **Observed on real hardware** — a person watched it happen on physical training machines.
+- **Not verified** — everything else, including behavior that automated tests cover. A green test suite proves the code does what the test says; it does not prove the product works.
+
+Automated test results are reported separately at the end, because they belong to none of the three.
+
+## Measured against the live deployment
+
+Performed on 2026-09-18 against the deployed Worker on its dedicated subdomain, using real credentials. No account IDs, hostnames, or tokens are recorded here.
+
+**Authentication, roles, and the control socket — 9 checks.**
+
+| Check | Result |
+|---|---|
+| `GET /health` unauthenticated | 200 |
+| Any `/api/*` route with no credentials | 401 |
+| A bad bearer token | 401 |
+| `GET /api/state` as instructor and as student | 200 both, with the student roster hidden from the student |
+| A student attempting a mode change | 403 |
+| An agent token with no device ID header | 401 |
+| An agent token presented with another student's device ID | 401 |
+| `GET /api/connect` without an upgrade header | 426 |
+| `GET /api/connect` as instructor and as student, with upgrade | 101, and the first frame on each socket was a state frame |
+
+**ICE and TURN — 12 checks.** Covering STUN, all three TURN transports (UDP, TCP, and TLS), the response always arriving as an array, credentials differing between two consecutive requests, and the permanent TURN key never appearing in any response body.
+
+**TLS.** Validates on the dedicated subdomain.
+
+**SFU negotiation order.** The offer goes up with session creation and the answer comes back in that same response: `POST /sessions/new` with `{sessionDescription: {type: "offer", sdp}}` returned `201` with an answer, and a body without `sessionDescription` was rejected with `400 decoding_error`. The published Cloudflare specification describes the opposite order and is stale; implementing it is why screen broadcast failed at the first call every time. The measured shape is encoded in the backend test fixtures. The request/response table is in [the protocol document](protocol.md).
+
+**The `/tracks/new` half is not verified.** The probe that would have settled it used a synthetic SDP whose DTLS fingerprint and ICE candidates were unusable, so the SFU waited on a transport that never established and the Worker's own 10-second timeout returned a 502 — a client-side artifact, not an SFU rejection. Whether `/tracks/new` also requires or returns a `sessionDescription` remains unknown.
+
+## Observed on real hardware
+
+**Screen broadcast from one instructor machine to one student machine works.** That is the whole of it. One instructor, one student, one direction.
+
+## Not verified
+
+Stated plainly, because none of this has been exercised on a real device:
+
+- **The Windows input lock has never engaged.** `nativeInputLock` is `false` on every device configuration, so no lock has ever actually run. Every locking check so far has been a display check.
+- **The student-app shutdown has never run on a real device.** The transient-fanout behavior and the absence of a restart counterpart are covered by tests and by code review only.
+- **Switching the shared screen has not been tried on real hardware.**
+- **Real throughput is unknown.** The only figure observed so far — roughly 15 kbps at 1 fps — was a static slide. It says what an idle screen costs, not what a class costs, and it cannot be used for capacity planning. The capacity figures in the documentation remain arithmetic.
+- **30 devices, and the five-hour soak.**
+- **Login auto-start.**
+- **Whether the recent fix removed the reported student-screen flicker.** The change stopped the Agent from reapplying its window state on every five-second heartbeat, which is a plausible cause, but nobody has watched a student screen since.
+
+Before operation, work through the [physical device acceptance checklist](acceptance.md).
+
+## Automated tests and continuous integration
+
+- Backend: 61 tests. Desktop apps: 128 tests. Backend type checking and the desktop syntax check pass.
+- CI on the default branch is green. It runs the backend tests, the backend typecheck, the apps tests, the apps syntax check, a local 30-connection WebSocket smoke test, the native helper build, `InputGuard.exe --self-test`, and a Worker deployment dry-run.
+- The native helper is exercised only with `--self-test`, which updates state without installing a live input hook. It has never suppressed real input.
+- Backend SFU calls are mocked in tests. The mock now matches the measured live contract for session creation; the `/tracks/new` half of the mock is an assumption, and is marked as one in the test file. A mock that does not match reality lets a fully green suite hide a product that cannot work — that is exactly what happened with the session-creation order.
+
+## Earlier local checks (historical)
+
+Recorded in a Windows development environment on 2026-09-17, before the live deployment existed. Counts below are historical and have since increased.
 
 - Local workerd integration (`node scripts/ws-smoke.mjs`) passed with one Controller and 30 simulated Agent WebSocket connections. Synthetic SFU ownership was seeded locally; no real video was sent.
-- Verified lock/practice fanout, per-agent roster privacy, a silent Controller's 15-second lease expiry while Agents continue heartbeating, rejection of stale lock revival, and safe release on Controller replacement/disconnect.
-- The final local practice fanout took approximately 10 ms. This is a development-machine observation, not an internet latency guarantee.
+- Verified lock/practice fanout, per-agent roster privacy, a silent Controller's 15-second lease expiry while Agents continued heartbeating, rejection of stale lock revival, and safe release on Controller replacement or disconnect.
+- The final local practice fanout took roughly 10 ms. A development-machine observation, not an internet latency guarantee.
 - Native helper rebuild and `--self-test` passed without enabling Windows input hooks.
-- Backend tests: 21 passed; desktop tests: 15 passed. Backend type checking, desktop syntax checks, and Worker deployment dry-run passed. Production desktop dependency audit reported zero vulnerabilities.
-- Desktop regression checks cover stale response timeouts, reconnects, safe shutdown, renderer heartbeat gating, and a practice-state response racing with a new screen publication.
-- Portable packaging passed with `npm.cmd run dist --prefix apps -- --config.compression=store`, producing `apps/dist/ClassRelay 0.1.0.exe` (386,354,745 bytes). Five packaged JavaScript sources match the final source files, and `ws` 8.21.3 is included. Compression was disabled for the local verification build; the executable is unsigned and was not launched against live input controls.
-- Actual Cloudflare streaming, physical Windows input suppression, startup after sign-in, and a 30-device/five-hour soak remain unverified.
-
-## Initial PoC checks (historical)
-
-The checks below describe the initial PoC. During repository preparation, the product/package metadata and window title were changed to ClassRelay, bilingual documentation and the supplied banner were added, and all 21 tests passed again. The historical executable was not rebuilt with the new branding and is not included in this repository.
-
-| Item | Result | Scope |
-|---|---|---|
-| Backend tests | 14 passed | Authentication, roles, simulated execution of live route/DO code, publish → subscribe → lease expiry, student isolation, failed-track rejection |
-| TypeScript check | Passed | `npm run typecheck` |
-| Cloudflare deployment preflight | Passed | `wrangler deploy --dry-run`; not an actual deployment |
-| Local Worker run | Passed | `/health` 200; unauthenticated `/api/state` 401 |
-| Token provisioning tool | Syntax check passed | No production tokens were generated or deployed |
-| Windows input-guard helper | Compilation and self-test passed | State update, emergency release, earlier-command rejection, expiry; no live input hook was run |
-| App safety tests | 7 passed | Lock/broadcast expiry, 15-second limit, delayed responses, persistent emergency release, new and prior commands |
-| App JavaScript check | Passed | Syntax checks for main, preload, renderer, and safety code |
-| Windows portable package | Passed | Produced `apps/dist/Classroom Cloudflare 0.1.0.exe`; unsigned PoC artifact retained under its historic filename |
-| Package-content comparison | Matched at the initial check | Four JavaScript files in unpacked `app.asar` matched the sources at that time; bundled InputGuard matched that build |
-
-Backend SFU calls were replaced by test responses. No actual Cloudflare account keys, domain, or training equipment were available, so production video streaming, TURN relay, live Windows input suppression, automatic start after sign-in, and a concurrent 30-device/eight-hour operating test were not performed.
-
-During integration review, a defect that treated an individual SFU track error inside an HTTP 200 response as a successful registration was fixed and covered by a regression test. The native input guard is checked only with `--self-test`, which does not suppress live input.
-
-Before operation, follow the [physical device acceptance checklist](acceptance.md).
+- Portable packaging passed with `npm.cmd run dist --prefix apps -- --config.compression=store`. The packaged JavaScript sources matched the final source files. Compression was disabled for that local build; the executable is unsigned and was never launched against live input controls.
+- During integration review, a defect that treated an individual SFU track error inside an HTTP 200 response as a successful registration was found and fixed, and covered by a regression test.
