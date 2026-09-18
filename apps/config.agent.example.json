@@ -4,5 +4,10 @@
   "token": "replace-with-agent-token",
   "deviceId": "student-01",
   "autoLaunch": false,
-  "nativeInputLock": false
+  "nativeInputLock": false,
+  "video": {
+    "maxHeight": 720,
+    "maxFps": 15,
+    "maxBitrateKbps": 2000
+  }
 }

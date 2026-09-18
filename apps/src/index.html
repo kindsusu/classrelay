@@ -14,13 +14,16 @@
       <div id="connection" class="status status-offline">연결 확인 중</div>
     </header>
 
+    <p id="rebroadcast-notice" class="rebroadcast hidden" role="status">서버에 다시 연결했지만 화면 송출은 중단된 상태입니다. 송출할 화면을 다시 선택하고 송출 버튼을 누르세요.</p>
+
     <section class="hero panel">
       <div>
         <p class="section-label">현재 수업 상태</p>
         <h2 id="mode-label">실습 모드</h2>
         <p id="mode-description">학생이 각자 노트북을 사용할 수 있습니다.</p>
+        <p id="publish-stats" class="stats-line hidden" aria-live="polite"></p>
       </div>
-      <div class="student-count"><strong id="student-count">0</strong><span>연결 학생</span></div>
+      <div class="student-count"><strong id="student-count">0</strong><span>연결 학생</span><em id="student-media">영상 0</em></div>
     </section>
 
     <section class="panel">
@@ -47,6 +50,7 @@
     <div id="input-shield" class="input-shield hidden" tabindex="0">
       <div class="shield-card"><div class="lock-icon">●</div><h2>이론교육 진행 중</h2><p>강사가 실습 모드로 전환하면 즉시 해제됩니다.</p><kbd>Ctrl + Shift + F12</kbd><small>비상 해제</small></div>
     </div>
+    <div id="agent-detail" class="agent-status agent-detail" aria-live="polite"></div>
     <div id="agent-status" class="agent-status">연결 중</div>
   </main>
   <script src="renderer.js"></script>

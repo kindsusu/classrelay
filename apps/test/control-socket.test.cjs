@@ -126,3 +126,50 @@ test('malformed state cannot keep a stalled connection alive', () => {
 test('websocket URL supports local HTTP development', () => {
   assert.equal(websocketUrl('http://127.0.0.1:8787'), 'ws://127.0.0.1:8787/api/connect');
 });
+
+test('the default heartbeat stays the bare frame the controller and smoke test send', () => {
+  const { client, sockets, clock } = socketHarness();
+  client.start();
+  sockets[0].emit('open');
+  clock.tick(10_000);
+  assert.deepEqual(sockets[0].sent.map(JSON.parse), [{ type: 'heartbeat' }, { type: 'heartbeat' }, { type: 'heartbeat' }]);
+  client.stop();
+});
+
+test('an agent reports its own media readiness on each heartbeat', () => {
+  let ready = false;
+  const { client, sockets, clock } = socketHarness({ mediaReady: () => ready });
+  client.start();
+  sockets[0].emit('open');
+  clock.tick(0);
+  assert.deepEqual(JSON.parse(sockets[0].sent[0]), { type: 'heartbeat', mediaReady: false });
+  ready = true;
+  clock.tick(5_000);
+  assert.deepEqual(JSON.parse(sockets[0].sent[1]), { type: 'heartbeat', mediaReady: true });
+  client.stop();
+});
+
+test('an undefined mediaReady mid-session falls back to the bare frame', () => {
+  let value = true;
+  const { client, sockets, clock } = socketHarness({ mediaReady: () => value });
+  client.start();
+  sockets[0].emit('open');
+  clock.tick(0);
+  assert.deepEqual(JSON.parse(sockets[0].sent[0]), { type: 'heartbeat', mediaReady: true });
+  value = undefined;
+  clock.tick(5_000);
+  assert.deepEqual(JSON.parse(sockets[0].sent[1]), { type: 'heartbeat' });
+  value = false;
+  clock.tick(5_000);
+  assert.deepEqual(JSON.parse(sockets[0].sent[2]), { type: 'heartbeat', mediaReady: false });
+  client.stop();
+});
+
+test('a suppressed heartbeat never reports media readiness', () => {
+  const { client, sockets, clock } = socketHarness({ canHeartbeat: () => false, mediaReady: () => true });
+  client.start();
+  sockets[0].emit('open');
+  clock.tick(5_000);
+  assert.equal(sockets[0].sent.length, 0);
+  client.stop();
+});

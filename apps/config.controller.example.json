@@ -3,5 +3,10 @@
   "backendUrl": "https://classroom.example.com",
   "token": "replace-with-controller-token",
   "deviceId": "instructor-01",
-  "autoLaunch": false
+  "autoLaunch": false,
+  "video": {
+    "maxHeight": 720,
+    "maxFps": 15,
+    "maxBitrateKbps": 2000
+  }
 }

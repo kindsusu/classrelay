@@ -25,6 +25,26 @@ let rendererMediaReady = false;
 let nativeGuardUnavailable = false;
 const safety = new SafetyState();
 
+const VIDEO_DEFAULTS = Object.freeze({ maxHeight: 720, maxFps: 15, maxBitrateKbps: 2_000 });
+const VIDEO_RANGES = Object.freeze({ maxHeight: [360, 1440], maxFps: [5, 30], maxBitrateKbps: [300, 8_000] });
+
+function resolveVideoConfig(raw) {
+  if (raw === undefined || raw === null) return { ...VIDEO_DEFAULTS };
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('video는 객체여야 합니다.');
+  // 오타 난 항목을 조용히 무시하면 대역폭 상한이 걸리지 않은 채 운영된다.
+  const unknown = Object.keys(raw).filter((key) => !(key in VIDEO_DEFAULTS));
+  if (unknown.length) throw new Error(`video에 알 수 없는 항목이 있습니다: ${unknown.join(', ')}`);
+  const resolved = { ...VIDEO_DEFAULTS };
+  for (const [key, [min, max]] of Object.entries(VIDEO_RANGES)) {
+    if (raw[key] === undefined) continue;
+    if (!Number.isInteger(raw[key]) || raw[key] < min || raw[key] > max) {
+      throw new Error(`video.${key}는 ${min}~${max} 사이 정수여야 합니다.`);
+    }
+    resolved[key] = raw[key];
+  }
+  return resolved;
+}
+
 function readConfig() {
   const configPath = process.env.CLASSROOM_CONFIG
     ? path.resolve(process.env.CLASSROOM_CONFIG)
@@ -39,7 +59,7 @@ function readConfig() {
   }
   if (typeof parsed.token !== 'string' || parsed.token.length < 8) throw new Error('token이 없거나 너무 짧습니다.');
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(parsed.deviceId || '')) throw new Error('deviceId 형식이 올바르지 않습니다.');
-  return { ...parsed, backendUrl: parsed.backendUrl.replace(/\/$/, '') };
+  return { ...parsed, backendUrl: parsed.backendUrl.replace(/\/$/, ''), video: resolveVideoConfig(parsed.video) };
 }
 
 function apiHeaders(extra = {}) {
@@ -199,6 +219,7 @@ function startControlSocket() {
     backendUrl: config.backendUrl,
     headers: apiHeaders(),
     canHeartbeat: () => config.role !== 'controller' || performance.now() - lastRendererPulse < 4_000,
+    mediaReady: () => (config.role === 'agent' ? rendererMediaReady : undefined),
     onState: acceptControlState,
     onConnection: (state) => {
       latestConnectionState = state;
@@ -249,7 +270,7 @@ function createWindow() {
 }
 
 function registerIpc() {
-  ipcMain.handle('config:get-public', () => ({ role: config.role, deviceId: config.deviceId, backendUrl: config.backendUrl, autoLaunch: startupEnabled() }));
+  ipcMain.handle('config:get-public', () => ({ role: config.role, deviceId: config.deviceId, backendUrl: config.backendUrl, autoLaunch: startupEnabled(), video: { ...(config.video || VIDEO_DEFAULTS) } }));
   ipcMain.on('renderer:pulse', (_event, mediaReady) => {
     lastRendererPulse = performance.now();
     rendererMediaReady = mediaReady === true;
@@ -330,3 +351,5 @@ app.on('before-quit', () => {
 });
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => { if (config?.role !== 'agent') app.quit(); });
+
+module.exports = { resolveVideoConfig, VIDEO_DEFAULTS, VIDEO_RANGES };

@@ -1,7 +1,8 @@
 export type Role = "controller" | "agent";
 export type Mode = "practice" | "broadcast" | "lock";
 export interface Stream { sessionId: string; trackName: string }
-export interface ClassroomSnapshot { revision: number; mode: Mode; leaseMs: number; stream: Stream | null; students: { deviceId: string; lastSeen: number }[] }
+/** `mediaReady` is the student's own report that it is receiving video. It is presence diagnostics only, never screen content or device telemetry. */
+export interface ClassroomSnapshot { revision: number; mode: Mode; leaseMs: number; stream: Stream | null; students: { deviceId: string; lastSeen: number; mediaReady: boolean }[] }
 
 export interface Env {
   CLASSROOM: DurableObjectNamespace;
@@ -14,7 +15,7 @@ export interface Env {
   TURN_API_TOKEN?: string;
 }
 interface Principal { role: Role; deviceId?: string }
-interface SocketAttachment extends Principal { connectionId: string; lastSeen: number }
+interface SocketAttachment extends Principal { connectionId: string; lastSeen: number; mediaReady: boolean }
 const LEASE_MS = 15_000;
 const RTC_BASE = "https://rtc.live.cloudflare.com/v1/apps";
 
@@ -36,6 +37,17 @@ export function expireLease(snapshot: ClassroomSnapshot, leaseUntil: number, now
 }
 export function ownsSession(owner: Principal | null, principal: Principal): boolean {
   return !!owner && owner.role === principal.role && owner.deviceId === principal.deviceId;
+}
+/** Accepts only `{type:"heartbeat"}` and an agent's `{type:"heartbeat", mediaReady:<boolean>}`. Returns null for anything else. */
+export function heartbeatFrame(payload: unknown, role: Role): { mediaReady?: boolean } | null {
+  if (!payload || typeof payload !== "object") return null;
+  const frame = payload as { type?: unknown; mediaReady?: unknown };
+  if (frame.type !== "heartbeat") return null;
+  const keys = Object.keys(payload);
+  if (keys.length === 1) return {};
+  // A controller receives no video, so accepting mediaReady from it would be a silent protocol hole.
+  if (keys.length !== 2 || !keys.includes("mediaReady") || typeof frame.mediaReady !== "boolean" || role !== "agent") return null;
+  return { mediaReady: frame.mediaReady };
 }
 function json(data: unknown, status = 200): Response { return Response.json(data, { status, headers: { "Cache-Control": "no-store" } }); }
 function error(message: string, status = 400): Response { return json({ error: message }, status); }
@@ -147,7 +159,12 @@ export default {
       if (!env.TURN_KEY_ID || !env.TURN_API_TOKEN) return json({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478"] }] });
       // Cloudflare TURN credentials are supplied as secrets; clients receive only short-lived ICE credentials.
       let turn: Response; try { turn = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate`, { method: "POST", headers: { Authorization: `Bearer ${env.TURN_API_TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify({ ttl: 3600 }), signal: AbortSignal.timeout(10_000) }); } catch { return error("TURN service unavailable", 502); }
-      return new Response(turn.body, { status: turn.status, headers: { "Content-Type": turn.headers.get("Content-Type") || "application/json", "Cache-Control": "no-store" } });
+      // A rejected Worker-held TURN credential is a server misconfiguration, not the caller's own 401; never proxy the upstream status or body verbatim.
+      if (!turn.ok) return error("Worker TURN credentials were rejected upstream", 502);
+      let payload: { iceServers?: unknown } | null; try { payload = await turn.json(); } catch { return error("TURN service returned an invalid response", 502); }
+      const iceServers = payload?.iceServers;
+      // Cloudflare returns one { urls, username, credential } object, not an array; always hand the client an array.
+      return json({ iceServers: Array.isArray(iceServers) ? iceServers : iceServers && typeof iceServers === "object" ? [iceServers] : [] });
     }
     return error("not found", 404);
   }
@@ -161,12 +178,13 @@ export class ClassroomState implements DurableObject {
       const value = socket.deserializeAttachment() as Partial<SocketAttachment> | null;
       if (!value || (value.role !== "controller" && value.role !== "agent") || typeof value.connectionId !== "string" || typeof value.lastSeen !== "number") return null;
       if (value.role === "agent" && typeof value.deviceId !== "string") return null;
-      return value as SocketAttachment;
+      // An attachment serialized before mediaReady existed must keep its live socket across a deploy, not be dropped.
+      return { ...value, mediaReady: value.mediaReady === true } as SocketAttachment;
     } catch { return null; }
   }
   private roster(): ClassroomSnapshot["students"] {
     return this.sockets().map((socket) => this.attachment(socket)).filter((a): a is SocketAttachment => !!a && a.role === "agent" && !!a.deviceId)
-      .map((a) => ({ deviceId: a.deviceId!, lastSeen: a.lastSeen })).sort((a, b) => a.deviceId.localeCompare(b.deviceId));
+      .map((a) => ({ deviceId: a.deviceId!, lastSeen: a.lastSeen, mediaReady: a.mediaReady })).sort((a, b) => a.deviceId.localeCompare(b.deviceId));
   }
   private async storedSnapshot(): Promise<ClassroomSnapshot> {
     const saved = await this.state.storage.get<ClassroomSnapshot>("snapshot");
@@ -217,7 +235,7 @@ export class ClassroomState implements DurableObject {
       if (role === "agent" && !deviceId) return error("agent device id required", 403);
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
-      const attachment: SocketAttachment = { role, ...(deviceId ? { deviceId } : {}), connectionId: crypto.randomUUID(), lastSeen: Date.now() };
+      const attachment: SocketAttachment = { role, ...(deviceId ? { deviceId } : {}), connectionId: crypto.randomUUID(), lastSeen: Date.now(), mediaReady: false };
       if (role === "controller") {
         // A reconnect starts a fresh control epoch. Never carry a previous lock or stream into it.
         await this.releaseController();
@@ -251,10 +269,11 @@ export class ClassroomState implements DurableObject {
     if (byteLength > 1_024) { socket.close(1009, "message too large"); return; }
     let payload: unknown;
     try { payload = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message)); } catch { socket.close(1008, "invalid JSON"); return; }
-    if (!payload || typeof payload !== "object" || (payload as { type?: unknown }).type !== "heartbeat" || Object.keys(payload).length !== 1) {
-      socket.close(1008, "only heartbeat messages are accepted"); return;
-    }
+    const frame = heartbeatFrame(payload, attachment.role);
+    if (!frame) { socket.close(1008, "only heartbeat messages are accepted"); return; }
     attachment.lastSeen = Date.now();
+    // Presence metadata only: it never touches mode, lease, or revision.
+    if (frame.mediaReady !== undefined) attachment.mediaReady = frame.mediaReady;
     socket.serializeAttachment(attachment);
     await this.snapshot();
     if (attachment.role === "controller") {

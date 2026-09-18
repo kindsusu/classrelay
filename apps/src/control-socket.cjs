@@ -28,6 +28,8 @@ class ControlSocket {
     this.onState = options.onState;
     this.onConnection = options.onConnection;
     this.canHeartbeat = options.canHeartbeat || (() => true);
+    // Agent-only liveness hint about its own video reception. undefined keeps the bare heartbeat frame.
+    this.mediaReady = options.mediaReady || (() => undefined);
     this.heartbeatMs = options.heartbeatMs || DEFAULT_HEARTBEAT_MS;
     this.staleMs = options.staleMs || DEFAULT_STALE_MS;
     this.now = options.now || (() => performance.now());
@@ -132,7 +134,8 @@ class ControlSocket {
       return;
     }
     if (this.canHeartbeat()) {
-      try { socket.send(JSON.stringify({ type: 'heartbeat' })); }
+      const mediaReady = this.mediaReady();
+      try { socket.send(JSON.stringify(typeof mediaReady === 'boolean' ? { type: 'heartbeat', mediaReady } : { type: 'heartbeat' })); }
       catch {
         try { socket.terminate(); } catch { socket.close(); }
         return;

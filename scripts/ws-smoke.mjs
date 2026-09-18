@@ -26,19 +26,48 @@ async function until(predicate, message, timeout = 5000) {
 try {
   const origin = (await mf.ready).origin;
   async function connect(deviceId) {
-    const peer = { states: [], errors: [] };
+    // mediaReady is a synthetic agent-side liveness flag only; no media is captured or produced anywhere in this script.
+    const peer = { states: [], errors: [], deviceId, mediaReady: false, closed: null };
     peer.ws = new WebSocket(`${origin.replace(/^http/, 'ws')}/api/connect`, {
       headers: { Authorization: `Bearer ${deviceId ? tokens[deviceId] : 'synthetic-controller'}`, ...(deviceId ? { 'X-Device-Id': deviceId } : {}) },
     });
     peers.push(peer);
     peer.ws.on('message', (raw) => { const event = JSON.parse(raw.toString()); if (event.type === 'state') peer.states.push(event.state); });
     peer.ws.on('error', (err) => peer.errors.push(err.message));
+    peer.ws.on('close', (code, reason) => { peer.closed = [code, reason.toString()]; });
     await until(() => peer.states.length > 0, 'initial state not delivered');
-    peer.timer = setInterval(() => { if (peer.ws.readyState === WebSocket.OPEN) peer.ws.send(JSON.stringify({ type: 'heartbeat' })); }, 5000);
+    peer.heartbeat = () => { if (peer.ws.readyState === WebSocket.OPEN) peer.ws.send(JSON.stringify(deviceId ? { type: 'heartbeat', mediaReady: peer.mediaReady } : { type: 'heartbeat' })); };
+    peer.timer = setInterval(peer.heartbeat, 5000);
     return peer;
+  }
+  async function controllerState() {
+    const result = await fetch(`${origin}/api/state`, { headers: { Authorization: 'Bearer synthetic-controller' } });
+    assert.equal(result.status, 200, await result.clone().text());
+    return result.json();
+  }
+  async function rosterWhen(predicate, message, timeout = 5000) {
+    const end = performance.now() + timeout;
+    for (;;) {
+      const { students } = await controllerState();
+      if (predicate(students)) return students;
+      assert.ok(performance.now() < end, message);
+      await sleep(50);
+    }
   }
   const controller = await connect();
   const agents = await Promise.all(Object.keys(tokens).map(connect));
+  const initial = await controllerState();
+  assert.equal(initial.students.length, 30, 'controller did not see all 30 control connections');
+  assert.ok(initial.students.every((s) => s.mediaReady === false), 'mediaReady must be false until the device itself reports true');
+  for (const peer of agents.slice(0, 28)) peer.mediaReady = true;
+  for (const peer of agents) peer.heartbeat();
+  const mixed = await rosterWhen((s) => s.filter((x) => x.mediaReady).length === 28, 'controller did not observe 28 media-ready students');
+  assert.equal(mixed.length, 30, 'control connection count and media-ready count must be reported separately');
+  assert.deepEqual(mixed.filter((s) => !s.mediaReady).map((s) => s.deviceId).sort(), agents.slice(28).map((p) => p.deviceId).sort(), 'wrong devices reported as not receiving video');
+  agents[0].mediaReady = false;
+  agents[0].heartbeat();
+  await rosterWhen((s) => s.filter((x) => x.mediaReady).length === 27, 'a device that stopped receiving video was not observed');
+  console.log('PASS: 30 control connections report 28 then 27 media-ready students; connection count alone never implies video success.');
   const namespace = await mf.getDurableObjectNamespace('CLASSROOM');
   const room = namespace.get(namespace.idFromName('training'));
   const stream = { sessionId: 'synthetic-stream', trackName: 'screen' };
@@ -77,8 +106,14 @@ try {
   clearInterval(replacement.timer);
   replacement.ws.close();
   await until(() => agents.every((p) => p.states.at(-1)?.mode === 'practice'), 'controller close did not release agents', 18000);
+  const strict = await connect();
+  strict.ws.send(JSON.stringify({ type: 'heartbeat', mediaReady: true }));
+  await until(() => strict.closed, 'controller mediaReady frame was not rejected');
+  assert.deepEqual(strict.closed, [1008, 'only heartbeat messages are accepted'], 'a controller must never be allowed to report mediaReady');
+  clearInterval(strict.timer);
+  assert.ok(agents.every((p) => p.states.every((s) => s.students.length === 0)), 'student roster leaked to an agent');
   assert.ok(peers.every((p) => p.errors.length === 0), 'unexpected transport errors');
-  console.log('PASS: late heartbeat cannot restore expired lock; controller replacement and disconnect release agents. No media/hardware validation performed.');
+  console.log('PASS: late heartbeat cannot restore expired lock; controller replacement and disconnect release agents; controller mediaReady rejected; roster never reaches an agent. No media/hardware validation performed.');
 } finally {
   for (const peer of peers) { clearInterval(peer.timer); peer.ws.terminate(); }
   await mf.dispose();

@@ -2,6 +2,19 @@
 
 const api = window.classroom;
 const $ = (id) => document.getElementById(id);
+
+const DEFAULT_VIDEO = { maxHeight: 720, maxFps: 15, maxBitrateKbps: 2_000 };
+const PUBLISH_STATS_MS = 2_000;
+const INBOUND_STATS_MS = 1_000;
+// 프리즈 판정 임계값. reportMediaFailure()는 main의 emergencyUnlock()을 거쳐 해당 revision의
+// 잠금을 영구 해제(latch)하므로 폴링 한 번의 결함으로 발동하면 안 된다. 1초 폴링에서 3초는
+// 연속 3회 무진행이고 15fps 기준 약 45프레임 분량이라 일시적 재전송·키프레임 대기로는 차지 않는다.
+// 동시에 서버 lease fail-safe(15초)보다 훨씬 짧아 학생이 죽은 화면 앞에서 오래 막히지 않는다.
+const FREEZE_MS = 3_000;
+const RESUBSCRIBE_BACKOFF_MS = [1_000, 3_000, 6_000];
+const MAX_RESUBSCRIBE_ATTEMPTS = RESUBSCRIBE_BACKOFF_MS.length;
+const ROSTER_CUTOFF_MS = 15_000;
+
 let config;
 let sources = [];
 let selectedSourceId = null;
@@ -15,12 +28,131 @@ let agentMediaReady = false;
 let controllerOnline = false;
 let controllerConnectionGeneration = 0;
 let latestControllerState = null;
+let rebroadcastRequired = false;
+let publishStatsTimer = null;
+let publishSample = null;
+let inboundStatsTimer = null;
+let inboundProgress = null;
+let mediaFrozen = false;
+let agentState = null;
+let agentStreamKey = null;
+let resubscribeTimer = null;
+let resubscribeAttempts = 0;
 
 function shouldStopPublishingForState(state, publication) {
   return state?.mode === 'practice'
     && Number.isSafeInteger(state.revision)
     && Number.isSafeInteger(publication?.activationRevision)
     && state.revision >= publication.activationRevision;
+}
+
+function summarizeRoster(students, now, cutoffMs = ROSTER_CUTOFF_MS) {
+  if (!Array.isArray(students)) return { connected: 0, media: 0 };
+  const live = students.filter((student) => Number(student?.lastSeen) >= now - cutoffMs);
+  return { connected: live.length, media: live.filter((student) => student?.mediaReady === true).length };
+}
+
+function shouldResubscribe(state, attempts, maxAttempts = MAX_RESUBSCRIBE_ATTEMPTS) {
+  return Boolean(state)
+    && state.mode !== 'practice'
+    && typeof state.stream?.sessionId === 'string'
+    && typeof state.stream?.trackName === 'string'
+    && Number(attempts) < maxAttempts;
+}
+
+function videoProgressValue(sample) {
+  if (Number.isFinite(sample?.framesDecoded)) return sample.framesDecoded;
+  if (Number.isFinite(sample?.bytesReceived)) return sample.bytesReceived;
+  return null;
+}
+
+function evaluateVideoProgress(previous, sample, freezeMs = FREEZE_MS) {
+  const value = videoProgressValue(sample);
+  const at = Number(sample?.at) || 0;
+  // 통계를 읽지 못하는 환경은 프리즈로 단정하지 않는다. 잠금 해제는 fail-safe지만
+  // 계측 부재만으로 latch를 걸면 정상 수업이 복구 불가능하게 끊긴다.
+  if (value === null) return { value: previous?.value ?? null, at: previous?.at ?? at, stalledMs: 0, frozen: false };
+  if (!previous || previous.value === null || value !== previous.value) return { value, at, stalledMs: 0, frozen: false };
+  const stalledMs = Math.max(0, at - previous.at);
+  return { value: previous.value, at: previous.at, stalledMs, frozen: stalledMs >= freezeMs };
+}
+
+function collectStats(report) {
+  const stats = [];
+  report?.forEach?.((value) => stats.push(value));
+  return stats;
+}
+
+function numberOrNull(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isVideo(stat) {
+  return stat?.kind === 'video' || stat?.mediaType === 'video';
+}
+
+function outboundVideoSample(stats, at) {
+  const outbound = stats.find((stat) => stat?.type === 'outbound-rtp' && isVideo(stat));
+  if (!outbound) return null;
+  const remote = stats.find((stat) => stat?.type === 'remote-inbound-rtp' && stat.id === outbound.remoteId)
+    || stats.find((stat) => stat?.type === 'remote-inbound-rtp' && isVideo(stat));
+  return {
+    at: Number(at) || 0,
+    width: numberOrNull(outbound.frameWidth) || 0,
+    height: numberOrNull(outbound.frameHeight) || 0,
+    fps: numberOrNull(outbound.framesPerSecond) || 0,
+    bytesSent: numberOrNull(outbound.bytesSent),
+    packetsSent: numberOrNull(outbound.packetsSent),
+    packetsLost: numberOrNull(remote?.packetsLost),
+    fractionLost: numberOrNull(remote?.fractionLost)
+  };
+}
+
+function inboundVideoSample(stats, at) {
+  const inbound = stats.find((stat) => stat?.type === 'inbound-rtp' && isVideo(stat));
+  if (!inbound) return null;
+  return {
+    at: Number(at) || 0,
+    width: numberOrNull(inbound.frameWidth) || 0,
+    height: numberOrNull(inbound.frameHeight) || 0,
+    fps: numberOrNull(inbound.framesPerSecond) || 0,
+    framesDecoded: numberOrNull(inbound.framesDecoded),
+    bytesReceived: numberOrNull(inbound.bytesReceived)
+  };
+}
+
+function deltaKbps(previous, sample, field) {
+  if (!previous || !sample || !Number.isFinite(sample[field]) || !Number.isFinite(previous[field])) return null;
+  const elapsed = sample.at - previous.at;
+  const bits = (sample[field] - previous[field]) * 8;
+  if (!(elapsed > 0) || !(bits >= 0)) return null;
+  return bits / elapsed; // bit/ms == kbit/s
+}
+
+function formatRate(kbps) {
+  return kbps >= 1_000 ? `${(kbps / 1_000).toFixed(1)}Mbps` : `${Math.round(kbps)}kbps`;
+}
+
+function lossPercent(previous, sample) {
+  if (Number.isFinite(sample?.fractionLost)) return Math.min(100, Math.max(0, sample.fractionLost * 100));
+  if (!previous || !Number.isFinite(sample?.packetsLost) || !Number.isFinite(previous.packetsLost)) return null;
+  const lost = sample.packetsLost - previous.packetsLost;
+  const sent = sample.packetsSent - previous.packetsSent;
+  if (!(sent > 0) || !(lost >= 0)) return null;
+  return Math.min(100, (lost / sent) * 100);
+}
+
+function formatMediaLine(previous, sample, field) {
+  if (!sample) return '';
+  const parts = [];
+  if (sample.width && sample.height) parts.push(`${sample.width}×${sample.height}`);
+  if (sample.fps) parts.push(`${Math.round(sample.fps)}fps`);
+  const kbps = deltaKbps(previous, sample, field);
+  if (kbps !== null) parts.push(formatRate(kbps));
+  const loss = lossPercent(previous, sample);
+  if (loss !== null) parts.push(`손실 ${loss.toFixed(1)}%`);
+  return parts.join(' · ');
 }
 
 function message(text, isError = false) {
@@ -30,10 +162,21 @@ function message(text, isError = false) {
   el.style.color = isError ? '#ff9994' : '#ffcc74';
 }
 
+function videoConfig() {
+  return config?.video || DEFAULT_VIDEO;
+}
+
+// Worker fallback (no TURN) sends an array; Worker-proxied Cloudflare TURN sends one {urls,username,credential}
+// object instead. RTCPeerConnection only accepts an array, so accept either shape and normalize to one.
+function normalizeIceServers(iceServers) {
+  if (Array.isArray(iceServers)) return iceServers;
+  return iceServers && typeof iceServers === 'object' ? [iceServers] : [];
+}
+
 async function iceConfiguration() {
   try {
     const result = await api.getIce();
-    return { iceServers: Array.isArray(result?.iceServers) ? result.iceServers : [] };
+    return { iceServers: normalizeIceServers(result?.iceServers) };
   } catch { return { iceServers: [] }; }
 }
 
@@ -47,10 +190,60 @@ async function waitIceComplete(pc, timeoutMs = 4_000) {
   });
 }
 
+async function applyTrackCaps(track, video) {
+  try {
+    // 화면은 PPT·문서 위주라 움직임보다 글자 가독성을 우선하도록 인코더에 힌트를 준다.
+    track.contentHint = 'text';
+    await track.applyConstraints?.({ height: { max: video.maxHeight }, frameRate: { max: video.maxFps } });
+  } catch (error) {
+    message(`송출 해상도 제한을 적용하지 못했습니다: ${error.message}`);
+  }
+}
+
+async function applySenderCaps(sender, video) {
+  try {
+    if (typeof sender?.getParameters !== 'function' || typeof sender.setParameters !== 'function') return;
+    // getParameters가 돌려준 객체를 그대로 수정해 넘겨야 한다. 새 객체를 만들면 transactionId가
+    // 달라 InvalidModificationError로 송출 자체가 실패한다.
+    const parameters = sender.getParameters();
+    if (!Array.isArray(parameters?.encodings) || !parameters.encodings[0]) return;
+    parameters.encodings[0].maxBitrate = video.maxBitrateKbps * 1_000;
+    parameters.encodings[0].maxFramerate = video.maxFps;
+    parameters.degradationPreference = 'maintain-resolution';
+    await sender.setParameters(parameters);
+  } catch (error) {
+    message(`송출 비트레이트 제한을 적용하지 못했습니다: ${error.message}`);
+  }
+}
+
+function stopPublishStats() {
+  if (publishStatsTimer) clearInterval(publishStatsTimer);
+  publishStatsTimer = null;
+  publishSample = null;
+  const el = $('publish-stats');
+  if (el) { el.textContent = ''; el.classList.add('hidden'); }
+}
+
+function startPublishStats(publication) {
+  stopPublishStats();
+  publishStatsTimer = setInterval(async () => {
+    if (publishing !== publication) return stopPublishStats();
+    let sample;
+    try { sample = outboundVideoSample(collectStats(await publication.pc.getStats()), performance.now()); }
+    catch { return; }
+    if (!sample || publishing !== publication) return;
+    const line = formatMediaLine(publishSample, sample, 'bytesSent');
+    publishSample = sample;
+    const el = $('publish-stats');
+    if (el && line) { el.textContent = `송출 ${line}`; el.classList.remove('hidden'); }
+  }, PUBLISH_STATS_MS);
+}
+
 async function stopPublishing() {
   if (!publishing) return;
   const active = publishing;
   publishing = null;
+  stopPublishStats();
   if (active.endedHandler) active.track.removeEventListener('ended', active.endedHandler);
   active.stream.getTracks().forEach((track) => track.stop());
   active.pc.close();
@@ -60,14 +253,20 @@ async function startPublishing() {
   if (publishing) return publishing.descriptor;
   if (!selectedSourceId) throw new Error('먼저 송출할 화면을 선택하세요.');
   await api.selectCaptureSource(selectedSourceId);
+  const video = videoConfig();
   let stream;
   let pc;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 20 } }, audio: false });
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { height: { max: video.maxHeight }, frameRate: { ideal: video.maxFps, max: video.maxFps } },
+      audio: false
+    });
     pc = new RTCPeerConnection(await iceConfiguration());
     const track = stream.getVideoTracks()[0];
+    await applyTrackCaps(track, video);
     const trackName = `screen-${config.deviceId}-${Date.now()}`;
     const transceiver = pc.addTransceiver(track, { direction: 'sendonly', streams: [stream] });
+    await applySenderCaps(transceiver.sender, video);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await waitIceComplete(pc);
@@ -82,6 +281,7 @@ async function startPublishing() {
     track.addEventListener('ended', endedHandler, { once: true });
     const descriptor = { sessionId: session.sessionId, trackName: result.tracks?.[0]?.trackName || trackName };
     publishing = { pc, stream, track, endedHandler, descriptor, activationRevision: null };
+    startPublishStats(publishing);
     pc.addEventListener('connectionstatechange', () => {
       if (pc.connectionState === 'failed' && publishing?.pc === pc) {
         message('화면 송출 연결이 끊겨 실습 모드로 해제합니다.', true);
@@ -107,6 +307,69 @@ function plainDescription(description) {
   return { type: description.type, sdp: description.sdp };
 }
 
+function setAgentDetail(text) {
+  const el = $('agent-detail');
+  if (el) el.textContent = text || '';
+}
+
+function stopInboundStats() {
+  if (inboundStatsTimer) clearInterval(inboundStatsTimer);
+  inboundStatsTimer = null;
+  inboundProgress = null;
+}
+
+function declareFreeze(generation) {
+  if (mediaFrozen || generation !== subscriptionGeneration) return;
+  mediaFrozen = true;
+  agentMediaReady = false;
+  // pulse(false)로 즉시 알려 main의 250ms watchdog이 다음 tick에 LOCK 기록을 멈추게 한다.
+  api.pulse(false);
+  stopSubscription();
+  api.reportMediaFailure();
+  $('agent-status').textContent = '강사 화면 신호가 멈춰 입력 차단을 해제했습니다.';
+  setAgentDetail(`영상 프레임이 ${FREEZE_MS / 1_000}초 이상 갱신되지 않았습니다. 강사의 새 명령을 기다립니다.`);
+}
+
+function startInboundStats(pc, generation) {
+  stopInboundStats();
+  let previous = null;
+  inboundStatsTimer = setInterval(async () => {
+    if (generation !== subscriptionGeneration || subscribing !== pc) return stopInboundStats();
+    let sample;
+    try { sample = inboundVideoSample(collectStats(await pc.getStats()), performance.now()); }
+    catch { return; }
+    if (!sample || generation !== subscriptionGeneration || mediaFrozen) return;
+    setAgentDetail(formatMediaLine(previous, sample, 'bytesReceived'));
+    previous = sample;
+    inboundProgress = evaluateVideoProgress(inboundProgress, sample);
+    if (inboundProgress.frozen) declareFreeze(generation);
+  }, INBOUND_STATS_MS);
+}
+
+function cancelResubscribe() {
+  if (resubscribeTimer) clearTimeout(resubscribeTimer);
+  resubscribeTimer = null;
+}
+
+// 해제된 revision을 되살리지 않는다. 재시도는 서버가 마지막으로 보낸 상태만 근거로 하고,
+// 비상 해제 뒤 main이 내려보내는 practice/stream:null 상태가 도착하면 즉시 멈춘다.
+function scheduleResubscribe(reason) {
+  if (resubscribeTimer) return;
+  if (!shouldResubscribe(agentState, resubscribeAttempts)) {
+    $('agent-status').textContent = `영상 연결 실패 · 강사에게 알려주세요 (${reason})`;
+    return;
+  }
+  const attempt = resubscribeAttempts + 1;
+  $('agent-status').textContent = `영상 재연결 시도 ${attempt}/${MAX_RESUBSCRIBE_ATTEMPTS}`;
+  resubscribeTimer = setTimeout(() => {
+    resubscribeTimer = null;
+    resubscribeAttempts = attempt;
+    if (!shouldResubscribe(agentState, attempt - 1)) return;
+    // addRemoteTrack은 이미 같은 트랙을 받고 있으면 undefined를 반환한다.
+    Promise.resolve(addRemoteTrack(agentState.stream)).catch((error) => scheduleResubscribe(error.message));
+  }, RESUBSCRIBE_BACKOFF_MS[resubscribeAttempts]);
+}
+
 function addRemoteTrack(streamInfo) {
   const key = `${streamInfo.sessionId}:${streamInfo.trackName}`;
   if (key === lastStreamKey && subscribing && subscribing.connectionState !== 'failed') return;
@@ -123,7 +386,11 @@ function addRemoteTrack(streamInfo) {
       $('remote-video').srcObject = event.streams[0] || new MediaStream([event.track]);
       $('agent-empty').classList.add('hidden');
       agentMediaReady = true;
+      mediaFrozen = false;
+      resubscribeAttempts = 0;
+      setAgentDetail('');
       api.pulse(true);
+      startInboundStats(pc, generation);
     };
     try {
       const session = assertRtc(await api.createRtcSession({}), '수신 RTC 세션 생성');
@@ -142,6 +409,7 @@ function addRemoteTrack(streamInfo) {
       pc.addEventListener('connectionstatechange', () => {
         if (pc.connectionState === 'failed' && generation === subscriptionGeneration) {
           agentMediaReady = false;
+          api.pulse(false);
           api.reportMediaFailure();
         }
       });
@@ -162,6 +430,8 @@ function addRemoteTrack(streamInfo) {
 function stopSubscription() {
   subscriptionGeneration += 1;
   agentMediaReady = false;
+  cancelResubscribe();
+  stopInboundStats();
   if (subscribing) subscribing.close();
   subscribing = null;
   lastStreamKey = null;
@@ -194,6 +464,10 @@ async function refreshSources() {
   }
 }
 
+function showRebroadcastNotice(visible) {
+  $('rebroadcast-notice')?.classList.toggle('hidden', !visible);
+}
+
 function renderControllerState(state) {
   latestControllerState = state;
   const labels = {
@@ -204,8 +478,10 @@ function renderControllerState(state) {
   const pair = labels[state.mode] || labels.practice;
   $('mode-label').textContent = pair[0];
   $('mode-description').textContent = pair[1];
-  const cutoff = Date.now() - 15_000;
-  $('student-count').textContent = Array.isArray(state.students) ? state.students.filter((student) => Number(student.lastSeen) >= cutoff).length : 0;
+  // 제어 소켓 연결 수만으로 30대 영상 성공을 판단하지 않는다.
+  const roster = summarizeRoster(state.students, Date.now());
+  $('student-count').textContent = roster.connected;
+  $('student-media').textContent = `영상 ${roster.media}`;
   $('connection').textContent = '서버 연결됨';
   $('connection').className = 'status status-online';
   if (shouldStopPublishingForState(state, publishing)) {
@@ -240,6 +516,8 @@ async function broadcast(mode) {
     if (publishing === publication) await stopPublishing();
     throw error;
   }
+  rebroadcastRequired = false;
+  showRebroadcastNotice(false);
   message(mode === 'lock' ? '입력 차단막을 표시했습니다.' : '화면 송출을 시작했습니다.');
 }
 
@@ -249,6 +527,8 @@ async function setPractice() {
   catch (error) { modeError = error; }
   finally { await stopPublishing(); }
   if (modeError) throw modeError;
+  rebroadcastRequired = false;
+  showRebroadcastNotice(false);
   message('모든 학생 PC를 실습 모드로 전환했습니다.');
 }
 
@@ -269,8 +549,13 @@ async function initController() {
     else {
       controllerOnline = false;
       controllerConnectionGeneration += 1;
-      if (publishing) stopPublishing().catch((error) => message(error.message, true));
+      if (publishing) {
+        // 재연결만으로 송출이 살아나지 않는다. 강사가 직접 다시 송출해야 한다는 사실을 남긴다.
+        rebroadcastRequired = true;
+        stopPublishing().catch((error) => message(error.message, true));
+      }
     }
+    showRebroadcastNotice(state.online && rebroadcastRequired);
     $('connection').textContent = state.online ? '서버 연결됨' : '연결 끊김';
     $('connection').className = `status ${state.online ? 'status-online' : 'status-offline'}`;
     if (!state.online && state.message) message(state.message, true);
@@ -287,11 +572,17 @@ function renderAgentMode(command) {
 }
 
 async function handleAgentState(state) {
-  renderAgentMode(state);
-  if (state.mode !== 'practice' && state.stream) {
-    try { await addRemoteTrack(state.stream); }
-    catch (error) { $('agent-status').textContent = `영상 연결 재시도 대기: ${error.message}`; }
+  agentState = state;
+  const key = state.stream ? `${state.stream.sessionId}:${state.stream.trackName}` : null;
+  if (key !== agentStreamKey) {
+    agentStreamKey = key;
+    resubscribeAttempts = 0;
+    cancelResubscribe();
   }
+  renderAgentMode(state);
+  if (state.mode === 'practice' || !state.stream) return;
+  try { await addRemoteTrack(state.stream); }
+  catch (error) { scheduleResubscribe(error.message); }
 }
 
 async function initAgent() {
@@ -314,5 +605,21 @@ async function initAgent() {
 });
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { shouldStopPublishingForState };
+  module.exports = {
+    shouldStopPublishingForState,
+    summarizeRoster,
+    shouldResubscribe,
+    normalizeIceServers,
+    videoProgressValue,
+    evaluateVideoProgress,
+    outboundVideoSample,
+    inboundVideoSample,
+    formatMediaLine,
+    lossPercent,
+    deltaKbps,
+    FREEZE_MS,
+    MAX_RESUBSCRIBE_ATTEMPTS,
+    RESUBSCRIBE_BACKOFF_MS,
+    DEFAULT_VIDEO
+  };
 }

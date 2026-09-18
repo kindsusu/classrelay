@@ -14,6 +14,8 @@ jobs:
       - run: npm run typecheck --prefix backend
       - run: npm test --prefix apps
       - run: npm run check --prefix apps
+      - name: WebSocket fail-safe smoke test (30 connections)
+        run: node scripts/ws-smoke.mjs
       - run: powershell.exe -NoProfile -File native-input/build.ps1
       - shell: pwsh
         run: |

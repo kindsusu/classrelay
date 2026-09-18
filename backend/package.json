@@ -14,5 +14,5 @@
   "homepage": "https://github.com/kindsusu/classrelay#readme",
   "type": "module",
   "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy", "typecheck": "tsc --noEmit", "test": "vitest run" },
-  "devDependencies": { "@cloudflare/workers-types": "^5.20260917.1", "typescript": "^5.9.2", "vitest": "^5.0.1", "wrangler": "^4.133.0" }
+  "devDependencies": { "@cloudflare/workers-types": "^5.20260917.1", "esbuild": "^0.28.1", "miniflare": "5.20260916.0-alpha", "typescript": "^5.9.2", "vitest": "^5.0.1", "wrangler": "^4.133.0" }
 }
