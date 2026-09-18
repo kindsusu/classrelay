@@ -2,6 +2,8 @@
   "name": "classroom-control",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-17",
+  // Dedicated subdomain on our own zone. Creating it must not alter any existing DNS record.
+  "routes": [{ "pattern": "class.hrteams.net", "custom_domain": true }],
   "durable_objects": { "bindings": [{ "name": "CLASSROOM", "class_name": "ClassroomState" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ClassroomState"] }]
 }
