@@ -85,9 +85,38 @@ While broadcasting, the Controller polls `RTCPeerConnection.getStats()` every tw
 
 The Controller counts control connections and video reception separately (`연결 학생` and `영상 N`), both using the same 15-second `lastSeen` cutoff. An attached control socket does not prove that device is receiving video, so the connection count alone must not be read as 30 successful video streams.
 
+## Class modes
+
+The instructor picks one of four modes. The wire value is what the backend stores; the Korean label is what both apps show.
+
+| Wire | Korean label | Student screen | Student input |
+|---|---|---|---|
+| `practice` | 실습 | Agent window hidden | Free |
+| `broadcast` | 화면 보여주기 | Instructor screen, fullscreen | Free |
+| `lecture` | 이론 모드 | Instructor screen, fullscreen and unobscured | Locked |
+| `lock` | 강사 주목 | Deliberately obscured | Locked |
+
+Every non-practice mode puts the Agent window into kiosk fullscreen, so the Windows taskbar and all window chrome are gone and the student sees nothing but the instructor's screen, like PowerPoint presentation mode.
+
+**Kiosk is not an input lock.** It hides chrome; it does not stop keystrokes. In `broadcast` the student's input is deliberately left free, so a determined student can still press Alt+Tab or Win+Tab and leave the classroom view. Only `lecture` and `lock` ask the native helper to suppress input, and only on a device where `nativeInputLock` is enabled. With that option off — which is the default — both locking modes show their overlay but suppress nothing.
+
+`lecture` and `lock` differ only in what the student sees. `lecture` leaves the instructor's video fully visible and marks the locked state with a small strip at the top of the screen that also names the `Ctrl+Shift+F12` emergency release. `lock` covers the video with the obscuring shield and tells the student to look at the instructor in the room. Neither overlay is what makes a lock safe: the overlay is presentation only, while the actual suppression and every release path live in the main process and the native helper.
+
+Pressing 실습 시작 also minimises the instructor window, so the instructor can use their own PC immediately. The other three modes leave the window up, because the instructor still has to drive the class. The window is minimised and never hidden, so the taskbar always leads back to it.
+
+## Shutting down the student apps
+
+학생 앱 종료 asks every connected Agent to quit. It requires an in-app confirmation first, because one click stops every connected machine at once, and it reports the backend's `notified` count so the instructor sees how many devices were actually reached rather than assuming all of them were.
+
+**This is not recoverable from the instructor side.** Once the student apps quit, the Controller cannot restart them remotely. Each student has to start the app again on their own PC, or sign in again where automatic launch is enabled.
+
+An Agent that receives the quit request releases everything before it exits: the native input guard is sent `UNLOCK`, kiosk and always-on-top come off, and the app then quits through the same teardown path an ordinary exit uses. The exit is marked as an intentional stop, so it is not mistaken for a crash that would report an emergency release.
+
 ## Input lock and fail-safe behavior
 
 Input lock is an instructional focus aid, not a Windows security boundary. It cannot block Windows secure-attention sequences such as `Ctrl+Alt+Delete`, nor is it intended to resist a local administrator.
+
+Two of the four modes lock input, so one predicate decides it: `locksInput(mode)` in `src/safety.cjs`, true for `lecture` and `lock` and nothing else. The native-guard-unavailable check, the renderer-liveness check, and the 250 ms `LOCK` renewal all route through it, so `lecture` inherits every release path `lock` has — the per-revision emergency-release latch, the 15-second lease, `render-process-gone`, the renderer pulse gate, and frozen-video detection. No call site compares the mode string directly.
 
 Press `Ctrl+Shift+F12` to release the classroom view immediately. An Agent also releases fullscreen and input suppression if backend state is unavailable for 15 seconds, its WebRTC connection fails, the associated process exits, or its lease expires. A released command revision is not restored by reconnection.
 
@@ -97,4 +126,4 @@ A subscription that fails to establish is retried up to three times with a 1/3/6
 
 If a control-socket reconnect dropped an active broadcast, the Controller shows a persistent prompt to select a screen and broadcast again. It clears once a new broadcast or practice command succeeds.
 
-When `nativeInputLock` is enabled, `InputGuard.exe` blocks ordinary keyboard and mouse input only while the main process, renderer, and valid lock lease are all active. It has an independent watchdog and releases on failure or timeout.
+When `nativeInputLock` is enabled, `InputGuard.exe` blocks ordinary keyboard and mouse input in `lecture` and `lock`, and only while the main process, renderer, and a valid lease are all active. It has an independent watchdog and releases on failure or timeout. The option stays opt-in per device and off by default; adding `lecture` did not change that.

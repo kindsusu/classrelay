@@ -1,5 +1,13 @@
 export type Role = "controller" | "agent";
-export type Mode = "practice" | "broadcast" | "lock";
+/**
+ * The four wire mode names, in one place so no other site enumerates them.
+ * `practice` students free, no stream. `broadcast` instructor screen visible, input free.
+ * `lecture` instructor screen visible and input locked. `lock` input locked and the screen
+ * deliberately obscured so students look at the instructor instead. `practice` is the fail-safe
+ * default every release falls back to; the other three are instructor commands that hold the lease.
+ */
+export const MODES = ["practice", "broadcast", "lecture", "lock"] as const;
+export type Mode = (typeof MODES)[number];
 export interface Stream { sessionId: string; trackName: string }
 /** `mediaReady` is the student's own report that it is receiving video. It is presence diagnostics only, never screen content or device telemetry. */
 export interface ClassroomSnapshot { revision: number; mode: Mode; leaseMs: number; stream: Stream | null; students: { deviceId: string; lastSeen: number; mediaReady: boolean }[] }
@@ -31,6 +39,25 @@ export function authenticate(request: Request, env: Pick<Env, "CONTROLLER_TOKEN"
   } catch { return null; }
 }
 /** Pure policy helpers keep the critical fail-safe and session boundary testable. */
+export function isMode(value: unknown): value is Mode {
+  return typeof value === "string" && (MODES as readonly string[]).includes(value);
+}
+/**
+ * The only modes that suppress student input: `lecture` (watch the instructor's screen) and `lock`
+ * (screen obscured, look at the instructor). Every backend decision about locking goes through this
+ * predicate so adding a locking mode can never leave a stray `mode === "lock"` behind.
+ */
+export function locksInput(mode: Mode): boolean {
+  return mode === "lecture" || mode === "lock";
+}
+/**
+ * Every commanded mode needs a published instructor track and holds the controller lease.
+ * `practice` is the only mode that clears the stream and holds no lease.
+ */
+export function requiresStream(mode: Mode): boolean {
+  return mode !== "practice";
+}
+/** Releases any commanded mode — `broadcast`, `lecture` and `lock` alike — once its lease is gone. */
 export function expireLease(snapshot: ClassroomSnapshot, leaseUntil: number, now = Date.now()): ClassroomSnapshot {
   if (snapshot.mode === "practice" || now < leaseUntil) return snapshot;
   return { ...snapshot, revision: snapshot.revision + 1, mode: "practice", stream: null };
@@ -52,6 +79,15 @@ export function heartbeatFrame(payload: unknown, role: Role): { mediaReady?: boo
 function json(data: unknown, status = 200): Response { return Response.json(data, { status, headers: { "Cache-Control": "no-store" } }); }
 function error(message: string, status = 400): Response { return json({ error: message }, status); }
 async function body(request: Request): Promise<Record<string, unknown> | null> { try { const text = await request.text(); if (new TextEncoder().encode(text).byteLength > 100_000) return null; const value = JSON.parse(text); return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null; } catch { return null; } }
+/** An absent body or `{}` and nothing else, so a parameterless command can never grow an implicit parameter. */
+async function emptyBody(request: Request): Promise<boolean> {
+  try {
+    const text = (await request.text()).trim();
+    if (text === "") return true;
+    const value = JSON.parse(text);
+    return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0;
+  } catch { return false; }
+}
 function isStream(value: unknown): value is Stream { return !!value && typeof value === "object" && typeof (value as Stream).sessionId === "string" && typeof (value as Stream).trackName === "string"; }
 
 async function stateStub(env: Env): Promise<DurableObjectStub> {
@@ -112,9 +148,10 @@ export default {
       const payload = await body(request);
       if (!payload) return error("invalid JSON");
       const mode = payload?.mode;
-      if (mode !== "practice" && mode !== "broadcast" && mode !== "lock") return error("invalid mode");
+      // Only the four wire names reach the state machine; shutting an app down is not a mode.
+      if (!isMode(mode)) return error("invalid mode");
       const stream = payload.stream;
-      if ((mode === "broadcast" || mode === "lock") && !isStream(stream)) return error("broadcast and lock require a stream");
+      if (requiresStream(mode) && !isStream(stream)) return error("broadcast, lecture and lock require a stream");
       if (stream && !isStream(stream)) return error("invalid stream");
       if (isStream(stream)) {
         const ownerResponse = await doCall(env, `/owner/${encodeURIComponent(stream.sessionId)}`);
@@ -122,8 +159,14 @@ export default {
         if (!ownsSession(owner, { role: "controller" })) return error("stream session is not owned by controller", 403);
         if (!(await doCall(env, `/published/${encodeURIComponent(stream.sessionId)}/${encodeURIComponent(stream.trackName)}`)).ok) return error("stream track was not published by controller", 403);
       }
-      await doCall(env, "/mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, stream: mode === "practice" ? null : stream }) });
+      await doCall(env, "/mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, stream: requiresStream(mode) ? stream : null }) });
       return json(await getState(env));
+    }
+    if (url.pathname === "/api/agents/quit" && request.method === "POST") {
+      if (principal.role !== "controller") return error("controller role required", 403);
+      if (!(await emptyBody(request))) return error("quit takes an empty JSON body");
+      // Transient fanout to the Agent sockets connected right now. It carries no state and changes none.
+      return doCall(env, "/agents/quit", { method: "POST" });
     }
     if (url.pathname === "/api/rtc/sessions" && request.method === "POST") {
       const current = await getState(env);
@@ -216,6 +259,24 @@ export class ClassroomState implements DurableObject {
     const snapshot = await this.snapshot();
     for (const socket of this.sockets()) this.send(socket, snapshot);
   }
+  /**
+   * Fire-and-forget shutdown fanout to the Agent sockets connected at this instant.
+   *
+   * The command is deliberately stored nowhere — not in the snapshot, not in Durable Object storage,
+   * not in a socket attachment — so an Agent that connects after it was issued never learns of it and
+   * never quits. It also never touches mode, revision, leaseMs, stream, or the controller lease:
+   * shutting an app down is orthogonal to the fail-safe state machine. A controller socket is never
+   * a target, and the instructor cannot start a student app again remotely afterwards.
+   */
+  private quitAgents(): number {
+    const frame = JSON.stringify({ type: "quit" });
+    let notified = 0;
+    for (const socket of this.sockets()) {
+      if (this.attachment(socket)?.role !== "agent") continue;
+      try { socket.send(frame); notified += 1; } catch { /* closing socket */ }
+    }
+    return notified;
+  }
   private async releaseController(connectionId?: string): Promise<void> {
     if (connectionId && await this.state.storage.get<string>("activeControllerConnectionId") !== connectionId) return;
     const current = await this.storedSnapshot();
@@ -259,7 +320,8 @@ export class ClassroomState implements DurableObject {
     if (url.pathname === "/published" && request.method === "POST") { const p = await body(request); if (!p || typeof p.sessionId !== "string" || typeof p.trackName !== "string") return error("invalid track"); await this.state.storage.put(`track:${p.sessionId}:${p.trackName}`, true); return json({ ok: true }); }
     if (url.pathname === "/session" && request.method === "POST") { const p = await body(request); if (!p || typeof p.sessionId !== "string" || (p.role !== "controller" && p.role !== "agent")) return error("invalid session"); await this.state.storage.put(`session:${p.sessionId}`, { role: p.role, deviceId: p.deviceId }); return json({ ok: true }); }
     if (url.pathname === "/heartbeat" && request.method === "POST") { const p = await body(request) as Principal | null; if (!p || (p.role !== "controller" && p.role !== "agent")) return error("invalid heartbeat"); await this.snapshot(); if (p.role === "controller") { const leaseUntil = Date.now() + LEASE_MS; await this.state.storage.put("leaseUntil", leaseUntil); await this.state.storage.setAlarm(leaseUntil); } return json({ ok: true }); }
-    if (url.pathname === "/mode" && request.method === "POST") { const input = await body(request); if (!input || (input.mode !== "practice" && input.mode !== "broadcast" && input.mode !== "lock")) return error("invalid mode"); const snapshot = await this.snapshot(); snapshot.mode = input.mode; snapshot.stream = input.mode === "practice" ? null : input.stream as Stream; snapshot.revision++; snapshot.students = []; const leaseUntil = Date.now() + LEASE_MS; await this.state.storage.put("snapshot", snapshot); await this.state.storage.put("leaseUntil", input.mode === "practice" ? 0 : leaseUntil); if (input.mode !== "practice") await this.state.storage.setAlarm(leaseUntil); await this.fanout(); return json(await this.snapshot()); }
+    if (url.pathname === "/mode" && request.method === "POST") { const input = await body(request); const mode = input?.mode; if (!input || !isMode(mode)) return error("invalid mode"); const snapshot = await this.snapshot(); snapshot.mode = mode; snapshot.stream = requiresStream(mode) ? input.stream as Stream : null; snapshot.revision++; snapshot.students = []; const leaseUntil = Date.now() + LEASE_MS; await this.state.storage.put("snapshot", snapshot); await this.state.storage.put("leaseUntil", requiresStream(mode) ? leaseUntil : 0); if (requiresStream(mode)) await this.state.storage.setAlarm(leaseUntil); await this.fanout(); return json(await this.snapshot()); }
+    if (url.pathname === "/agents/quit" && request.method === "POST") return json({ ok: true, notified: this.quitAgents() });
     return error("not found", 404);
   }
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {

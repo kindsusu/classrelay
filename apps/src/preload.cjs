@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('classroom', Object.freeze({
   listCaptureSources: () => ipcRenderer.invoke('capture:list'),
   selectCaptureSource: (id) => ipcRenderer.invoke('capture:select', id),
   setMode: (payload) => ipcRenderer.invoke('api:mode', payload),
+  quitAgents: () => ipcRenderer.invoke('api:quit-agents'),
+  backgroundWindow: () => ipcRenderer.send('window:background'),
   getIce: () => ipcRenderer.invoke('api:ice'),
   createRtcSession: (body) => ipcRenderer.invoke('rtc:session', body),
   addRtcTracks: (id, body) => ipcRenderer.invoke('rtc:tracks', id, body),

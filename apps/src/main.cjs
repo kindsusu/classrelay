@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const WebSocket = require('ws');
-const { SafetyState, ALLOWED_MODES } = require('./safety.cjs');
+const { SafetyState, ALLOWED_MODES, locksInput } = require('./safety.cjs');
 const { ControlSocket } = require('./control-socket.cjs');
 
 let mainWindow;
@@ -211,7 +211,9 @@ function applyAgentWindow() {
     mainWindow.show();
     mainWindow.setFullScreen(true);
     mainWindow.setAlwaysOnTop(true, 'screen-saver');
-    mainWindow.setKiosk(mode === 'lock');
+    // 비실습 모드는 전부 발표 모드처럼 작업 표시줄까지 덮는다. kiosk는 창 크롬을 가릴 뿐
+    // 입력 잠금이 아니다. 실제 입력 차단은 locksInput(mode)와 네이티브 InputGuard가 담당한다.
+    mainWindow.setKiosk(true);
     mainWindow.focus();
   }
   send('agent:mode', { mode, revision: safety.revision });
@@ -225,10 +227,34 @@ function emergencyUnlock(reason = 'shortcut') {
   send('agent:notice', `비상 해제됨 (${reason}). 새 명령 전까지 유지됩니다.`);
 }
 
+// 종료 경로는 하나만 둔다. stopping을 먼저 세워 뒤따르는 창 닫기·InputGuard 종료가 크래시로
+// 오인돼 emergencyUnlock을 부르지 않게 하고, 그 다음 입력 보호를 UNLOCK으로 되돌린다.
+// 두 번 불려도 안전해야 한다 — handleQuitCommand가 부르고 app.quit()이 before-quit으로 또 부른다.
+function teardown() {
+  stopping = true;
+  controlSocket?.stop();
+  clearInterval(watchdogTimer);
+  watchdogTimer = undefined;
+  if (mainWindow && !mainWindow.isDestroyed() && config?.role === 'agent') {
+    mainWindow.setKiosk(false);
+    mainWindow.setAlwaysOnTop(false);
+  }
+  writeInputGuard('UNLOCK');
+  inputGuard?.stdin?.end();
+}
+
+// 강사의 학생 앱 종료 명령. 입력 보호 해제와 kiosk 해제가 끝난 뒤에만 종료한다.
+function handleQuitCommand() {
+  if (config?.role !== 'agent') return;
+  teardown();
+  send('agent:notice', '강사가 앱 종료를 요청했습니다. 입력 차단을 해제하고 종료합니다.');
+  app.quit();
+}
+
 function acceptControlState(state) {
   if (config.role === 'agent') {
     if (!safety.accept(state)) return;
-    if (nativeGuardUnavailable && state.mode === 'lock') safety.emergencyUnlock();
+    if (nativeGuardUnavailable && locksInput(state.mode)) safety.emergencyUnlock();
     applyAgentWindow();
     latestState = sanitizedState(state);
   } else {
@@ -245,6 +271,7 @@ function startControlSocket() {
     canHeartbeat: () => config.role !== 'controller' || performance.now() - lastRendererPulse < 4_000,
     mediaReady: () => (config.role === 'agent' ? rendererMediaReady : undefined),
     onState: acceptControlState,
+    onQuit: handleQuitCommand,
     onConnection: (state) => {
       latestConnectionState = state;
       if (rendererStateReady) send('connection:update', state);
@@ -326,6 +353,16 @@ function registerIpc() {
     if (payload.stream && typeof payload.stream.sessionId === 'string' && typeof payload.stream.trackName === 'string') body.stream = payload.stream;
     return api('/api/mode', { method: 'POST', body: JSON.stringify(body) });
   });
+  ipcMain.handle('api:quit-agents', () => {
+    if (config.role !== 'controller') throw new Error('controller 전용 기능입니다.');
+    return api('/api/agents/quit', { method: 'POST', body: JSON.stringify({}) });
+  });
+  // 실습 시작 직후 강사가 자기 PC를 바로 쓰게 창을 내린다. 트레이 아이콘이 없으므로 hide()가
+  // 아니라 minimize()만 쓴다 — 작업 표시줄에서 항상 되돌릴 수 있어야 한다.
+  ipcMain.on('window:background', () => {
+    if (config.role !== 'controller' || !mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.minimize();
+  });
   ipcMain.handle('api:ice', () => api('/api/ice'));
   ipcMain.handle('rtc:session', (_event, body) => {
     // 라이브 SFU는 세션 생성에서 offer를 요구한다. 빈 body는 업스트림 400으로만 끝나므로 여기서 막는다.
@@ -359,25 +396,18 @@ app.whenReady().then(() => {
   if (config.autoLaunch === true) configureStartup(true);
   startControlSocket();
   watchdogTimer = setInterval(() => {
-    if (config.role === 'agent' && safety.effectiveMode() === 'practice' && safety.mode !== 'practice') emergencyUnlock('15초 연결 제한');
+    const agent = config.role === 'agent';
+    if (agent && safety.effectiveMode() === 'practice' && safety.mode !== 'practice') emergencyUnlock('15초 연결 제한');
     const rendererHealthy = performance.now() - lastRendererPulse < 4_000;
-    if (config.role === 'agent' && safety.effectiveMode() === 'lock' && !rendererHealthy) emergencyUnlock('화면 프로세스 응답 없음');
-    if (config.role === 'agent' && safety.effectiveMode() === 'lock' && rendererHealthy && rendererMediaReady) writeInputGuard(`LOCK ${safety.revision}`);
+    // effectiveMode()는 조건마다 새로 읽는다. 앞선 emergencyUnlock이 이미 해제했을 수 있고,
+    // 값을 한 번 담아 재사용하면 해제된 직후 tick에서 LOCK을 다시 써 버린다.
+    if (agent && locksInput(safety.effectiveMode()) && !rendererHealthy) emergencyUnlock('화면 프로세스 응답 없음');
+    if (agent && locksInput(safety.effectiveMode()) && rendererHealthy && rendererMediaReady) writeInputGuard(`LOCK ${safety.revision}`);
     else writeInputGuard('UNLOCK');
   }, 250);
 });
 
-app.on('before-quit', () => {
-  stopping = true;
-  controlSocket?.stop();
-  clearInterval(watchdogTimer);
-  if (mainWindow && config?.role === 'agent') {
-    mainWindow.setKiosk(false);
-    mainWindow.setAlwaysOnTop(false);
-  }
-  writeInputGuard('UNLOCK');
-  inputGuard?.stdin?.end();
-});
+app.on('before-quit', teardown);
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => { if (config?.role !== 'agent') app.quit(); });
 

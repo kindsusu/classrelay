@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { ControlSocket, websocketUrl } = require('../src/control-socket.cjs');
+const { ControlSocket, websocketUrl, validSnapshot, quitFrame } = require('../src/control-socket.cjs');
 
 class FakeClock {
   constructor() { this.now = 0; this.nextId = 1; this.tasks = new Map(); }
@@ -171,5 +171,83 @@ test('a suppressed heartbeat never reports media readiness', () => {
   sockets[0].emit('open');
   clock.tick(5_000);
   assert.equal(sockets[0].sent.length, 0);
+  client.stop();
+});
+
+test('every wire mode including lecture is a valid snapshot and nothing else is', () => {
+  for (const mode of ['practice', 'broadcast', 'lecture', 'lock']) {
+    assert.equal(validSnapshot({ revision: 1, mode, leaseMs: 0 }), true, mode);
+  }
+  for (const mode of ['quit', 'Lecture', 'watch', '', null, undefined]) {
+    assert.equal(validSnapshot({ revision: 1, mode, leaseMs: 0 }), false, String(mode));
+  }
+  assert.equal(validSnapshot({ revision: 1.5, mode: 'lecture', leaseMs: 0 }), false);
+  assert.equal(validSnapshot({ revision: 1, mode: 'lecture', leaseMs: -1 }), false);
+});
+
+test('a lecture state frame reaches the renderer like any other mode', () => {
+  const { client, sockets, states } = socketHarness();
+  client.start();
+  sockets[0].emit('open');
+  sockets[0].emit('message', JSON.stringify({ type: 'state', state: { revision: 7, mode: 'lecture', leaseMs: 15_000, stream: { sessionId: 's', trackName: 'screen' } } }));
+  assert.deepEqual(states.map((state) => state.mode), ['lecture']);
+  client.stop();
+});
+
+test('an exact quit frame fires onQuit once and is never mistaken for state', () => {
+  const quits = [];
+  const { client, sockets, states } = socketHarness({ onQuit: () => quits.push(1) });
+  client.start();
+  sockets[0].emit('open');
+  sockets[0].emit('message', JSON.stringify({ type: 'quit' }));
+  assert.equal(quits.length, 1);
+  assert.deepEqual(states, []);
+  client.stop();
+});
+
+test('a malformed quit frame is ignored and never shuts an app down', () => {
+  const quits = [];
+  const { client, sockets, states } = socketHarness({ onQuit: () => quits.push(1) });
+  client.start();
+  sockets[0].emit('open');
+  for (const frame of [
+    { type: 'quit', deviceId: 'student-01' }, { type: 'quit', force: true }, { type: 'quit', mode: 'lock' },
+    { type: 'Quit' }, { type: 'quit ' }, { quit: true }, { type: 'state', state: { revision: 1, mode: 'quit', leaseMs: 0 } },
+    [{ type: 'quit' }], 'quit', null, 0
+  ]) {
+    sockets[0].emit('message', JSON.stringify(frame));
+  }
+  sockets[0].emit('message', 'not json');
+  assert.deepEqual(quits, []);
+  assert.deepEqual(states, []);
+  client.stop();
+});
+
+test('the quit frame predicate accepts only the bare frame', () => {
+  assert.equal(quitFrame({ type: 'quit' }), true);
+  for (const value of [{ type: 'quit', extra: 1 }, { type: 'state' }, { type: 'heartbeat' }, [], null, undefined, 'quit', 3]) {
+    assert.equal(quitFrame(value), false, JSON.stringify(value) ?? String(value));
+  }
+});
+
+test('onQuit defaults to a no-op so a quit frame cannot crash a running app', () => {
+  const { client, sockets, states, clock } = socketHarness();
+  client.start();
+  sockets[0].emit('open');
+  sockets[0].emit('message', JSON.stringify({ type: 'quit' }));
+  clock.tick(5_000);
+  assert.deepEqual(states, []);
+  assert.deepEqual(sockets[0].sent.map(JSON.parse), [{ type: 'heartbeat' }, { type: 'heartbeat' }]);
+  client.stop();
+});
+
+test('a quit frame does not stand in for a state frame in the 15s stale watchdog', () => {
+  const { client, sockets, clock } = socketHarness({ onQuit: () => {} });
+  client.start();
+  sockets[0].emit('open');
+  clock.tick(10_000);
+  sockets[0].emit('message', JSON.stringify({ type: 'quit' }));
+  clock.tick(5_000);
+  assert.equal(sockets[0].terminated, true);
   client.stop();
 });

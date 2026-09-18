@@ -509,14 +509,30 @@ function showRebroadcastNotice(visible) {
   $('rebroadcast-notice')?.classList.toggle('hidden', !visible);
 }
 
+const MODE_LABELS = {
+  practice: ['실습 모드', '학생이 각자 노트북을 사용할 수 있습니다.'],
+  broadcast: ['화면 보여주기', '강사 화면이 학생 PC에 전체화면으로 표시됩니다. 학생 입력은 막지 않습니다.'],
+  lecture: ['이론 모드', '강사 화면을 가리지 않고 보여주면서 학생 입력만 차단합니다.'],
+  lock: ['강사 주목', '학생 화면을 가리고 입력을 차단합니다. 학생은 강의실에서 강사를 봅니다.']
+};
+
+const COMMAND_MESSAGES = {
+  broadcast: '강사 화면을 학생 PC에 표시했습니다. 학생 입력은 자유입니다.',
+  lecture: '이론 모드로 전환했습니다. 강사 화면은 그대로 보이고 학생 입력만 차단됩니다.',
+  lock: '강사 주목 모드로 전환했습니다. 학생 화면을 가리고 입력을 차단했습니다.'
+};
+
+function controllerModeLabel(mode) {
+  return MODE_LABELS[mode] || MODE_LABELS.practice;
+}
+
+function commandMessage(mode) {
+  return COMMAND_MESSAGES[mode] || '명령을 전송했습니다.';
+}
+
 function renderControllerState(state) {
   latestControllerState = state;
-  const labels = {
-    practice: ['실습 모드', '학생이 각자 노트북을 사용할 수 있습니다.'],
-    broadcast: ['화면 송출 중', '강사 화면이 학생 PC에 전체화면으로 표시됩니다.'],
-    lock: ['이론교육 잠금', '학생 PC에 입력 차단막이 표시됩니다.']
-  };
-  const pair = labels[state.mode] || labels.practice;
+  const pair = controllerModeLabel(state.mode);
   $('mode-label').textContent = pair[0];
   $('mode-description').textContent = pair[1];
   // 제어 소켓 연결 수만으로 30대 영상 성공을 판단하지 않는다.
@@ -559,10 +575,12 @@ async function broadcast(mode) {
   }
   rebroadcastRequired = false;
   showRebroadcastNotice(false);
-  message(mode === 'lock' ? '입력 차단막을 표시했습니다.' : '화면 송출을 시작했습니다.');
+  message(commandMessage(mode));
 }
 
-async function setPractice() {
+// background는 강사가 실습 시작을 직접 누른 경우에만 true다. 송출 실패·트랙 종료로 자동 전환된
+// 실습에서 창을 내리면 방금 띄운 오류 메시지가 강사 눈에서 사라진다.
+async function setPractice({ background = false } = {}) {
   let modeError;
   try { await api.setMode({ mode: 'practice' }); }
   catch (error) { modeError = error; }
@@ -571,6 +589,21 @@ async function setPractice() {
   rebroadcastRequired = false;
   showRebroadcastNotice(false);
   message('모든 학생 PC를 실습 모드로 전환했습니다.');
+  if (background) api.backgroundWindow();
+}
+
+function quitReportMessage(result) {
+  const notified = Number(result?.notified);
+  if (!Number.isInteger(notified) || notified < 0) {
+    return '학생 앱에 종료를 전달했지만 전달 대수를 확인하지 못했습니다. 학생 PC를 직접 확인하세요.';
+  }
+  if (notified === 0) return '종료를 전달할 학생 앱이 없었습니다. 연결된 학생 앱이 없습니다.';
+  return `학생 앱 ${notified}대에 종료를 전달했습니다. 강사 앱에서는 다시 실행할 수 없습니다.`;
+}
+
+function showQuitConfirm(visible) {
+  $('quit-confirm')?.classList.toggle('hidden', !visible);
+  $('quit-agents')?.classList.toggle('hidden', visible);
 }
 
 async function initController() {
@@ -582,8 +615,17 @@ async function initController() {
   });
   $('refresh-sources').addEventListener('click', () => refreshSources().catch((error) => message(error.message, true)));
   $('broadcast').addEventListener('click', () => withBusy(() => broadcast('broadcast')));
+  $('lecture').addEventListener('click', () => withBusy(() => broadcast('lecture')));
   $('lock').addEventListener('click', () => withBusy(() => broadcast('lock')));
-  $('practice').addEventListener('click', () => withBusy(setPractice));
+  $('practice').addEventListener('click', () => withBusy(() => setPractice({ background: true })));
+  // 30대를 한꺼번에 멈추는 명령이라 확인을 받는다. window.confirm은 렌더러를 동기 차단해
+  // pulse가 끊기고 4초 뒤 heartbeat가 멈춰 서버 lease까지 만료되므로 쓰지 않는다.
+  $('quit-agents').addEventListener('click', () => showQuitConfirm(true));
+  $('quit-cancel').addEventListener('click', () => showQuitConfirm(false));
+  $('quit-proceed').addEventListener('click', () => withBusy(async () => {
+    showQuitConfirm(false);
+    message(quitReportMessage(await api.quitAgents()));
+  }));
   api.onState(renderControllerState);
   api.onConnection((state) => {
     if (state.online) controllerOnline = true;
@@ -605,10 +647,25 @@ async function initController() {
   await refreshSources();
 }
 
+const AGENT_STATUS = {
+  practice: '실습 모드',
+  broadcast: '강사 화면 송출 중',
+  lecture: '이론 모드 · 입력 차단 중 · 비상 해제 Ctrl+Shift+F12',
+  lock: '강사 주목 · 입력 차단 중 · 비상 해제 Ctrl+Shift+F12'
+};
+
+function agentStatusText(mode) {
+  return AGENT_STATUS[mode] || AGENT_STATUS.practice;
+}
+
+// lecture는 강사 화면을 가려서는 안 되므로 차단막을 띄우지 않고 상단 띠로만 알린다.
+// 실제 입력 차단은 이 오버레이가 아니라 main의 locksInput 경로와 네이티브 InputGuard가 한다.
 function renderAgentMode(command) {
-  $('input-shield').classList.toggle('hidden', command.mode !== 'lock');
-  $('agent-status').textContent = command.mode === 'lock' ? '입력 차단 중 · 비상 해제 Ctrl+Shift+F12' : '강사 화면 송출 중';
-  if (command.mode === 'lock') $('input-shield').focus();
+  const locked = command.mode === 'lock';
+  $('input-shield').classList.toggle('hidden', !locked);
+  $('lecture-note').classList.toggle('hidden', command.mode !== 'lecture');
+  $('agent-status').textContent = agentStatusText(command.mode);
+  if (locked) $('input-shield').focus();
   if (command.mode === 'practice') stopSubscription();
 }
 
@@ -663,6 +720,12 @@ if (typeof module !== 'undefined' && module.exports) {
     formatMediaLine,
     lossPercent,
     deltaKbps,
+    controllerModeLabel,
+    commandMessage,
+    agentStatusText,
+    quitReportMessage,
+    MODE_LABELS,
+    AGENT_STATUS,
     FREEZE_MS,
     MAX_RESUBSCRIBE_ATTEMPTS,
     RESUBSCRIBE_BACKOFF_MS,

@@ -2,7 +2,7 @@
 
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_STALE_MS = 15_000;
-const MODES = new Set(['practice', 'broadcast', 'lock']);
+const MODES = new Set(['practice', 'broadcast', 'lecture', 'lock']);
 
 function validSnapshot(state) {
   return Boolean(state)
@@ -10,6 +10,19 @@ function validSnapshot(state) {
     && MODES.has(state.mode)
     && Number.isFinite(Number(state.leaseMs))
     && Number(state.leaseMs) >= 0;
+}
+
+/**
+ * The server-only shutdown frame, exactly `{"type":"quit"}`. Any extra key makes it not a quit
+ * frame, so a future server field can never be mistaken for a shutdown order. It carries no state,
+ * so it never becomes a class mode and never survives the socket it arrived on.
+ */
+function quitFrame(message) {
+  return Boolean(message)
+    && typeof message === 'object'
+    && !Array.isArray(message)
+    && message.type === 'quit'
+    && Object.keys(message).length === 1;
 }
 
 function websocketUrl(backendUrl) {
@@ -27,6 +40,8 @@ class ControlSocket {
     this.headers = options.headers;
     this.onState = options.onState;
     this.onConnection = options.onConnection;
+    // Server-initiated shutdown request. Transient by design: nothing about it is remembered or replayed.
+    this.onQuit = options.onQuit || (() => {});
     this.canHeartbeat = options.canHeartbeat || (() => true);
     // Agent-only liveness hint about its own video reception. undefined keeps the bare heartbeat frame.
     this.mediaReady = options.mediaReady || (() => undefined);
@@ -97,6 +112,9 @@ class ControlSocket {
       let message;
       try { message = JSON.parse(String(data)); }
       catch { return; }
+      // A quit frame is a notification only: it must not refresh the stale watchdog or the backoff,
+      // because a server that sends nothing but quit frames is still an unhealthy control channel.
+      if (quitFrame(message)) { this.onQuit(); return; }
       if (message?.type !== 'state' || !validSnapshot(message.state)) return;
       this.lastMessageAt = this.now();
       this.retryMs = 1_000;
@@ -155,4 +173,4 @@ class ControlSocket {
   }
 }
 
-module.exports = { ControlSocket, websocketUrl, validSnapshot, DEFAULT_HEARTBEAT_MS, DEFAULT_STALE_MS };
+module.exports = { ControlSocket, websocketUrl, validSnapshot, quitFrame, DEFAULT_HEARTBEAT_MS, DEFAULT_STALE_MS };

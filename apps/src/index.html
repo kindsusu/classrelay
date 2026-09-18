@@ -32,14 +32,29 @@
     </section>
 
     <section class="actions">
-      <button id="broadcast" class="action action-blue"><span>화면 송출</span><small>선택 화면을 학생 PC에 전체화면 표시</small></button>
-      <button id="lock" class="action action-amber"><span>이론교육 잠금</span><small>송출 화면 위 입력 차단막 사용</small></button>
-      <button id="practice" class="action action-green"><span>실습 시작</span><small>즉시 화면과 잠금 해제</small></button>
+      <button id="broadcast" class="action action-blue"><span>화면 보여주기</span><small>강사 화면을 학생 PC 전체화면으로 표시 · 학생 입력은 자유</small></button>
+      <button id="lecture" class="action action-amber"><span>이론 모드</span><small>강사 화면을 가리지 않고 보여주며 학생 입력만 차단</small></button>
+      <button id="lock" class="action action-violet"><span>강사 주목</span><small>학생 화면을 가리고 입력 차단 · 강의실의 강사를 보게 함</small></button>
+      <button id="practice" class="action action-green"><span>실습 시작</span><small>화면과 잠금을 즉시 해제하고 이 창을 작업 표시줄로 내림</small></button>
     </section>
 
     <section class="panel settings-row">
       <div><p class="section-label">Windows 시작 설정</p><p class="muted">Windows에 로그인한 뒤 앱을 자동 실행합니다.</p></div>
       <label class="toggle"><input id="startup" type="checkbox"><span></span></label>
+    </section>
+
+    <section class="panel danger-row">
+      <div class="danger-head">
+        <div>
+          <p class="section-label danger-label">학생 앱 종료</p>
+          <p class="muted">연결된 학생 앱을 모두 종료합니다. <strong>강사 앱에서는 다시 실행할 수 없습니다</strong> — 각 학생이 자기 PC에서 직접 실행해야 합니다.</p>
+        </div>
+        <button id="quit-agents" class="button danger">학생 앱 종료</button>
+      </div>
+      <div id="quit-confirm" class="quit-confirm hidden" role="alertdialog" aria-label="학생 앱 종료 확인">
+        <p>연결된 학생 앱이 한꺼번에 종료됩니다. 강사 앱에서 다시 실행할 수 없고, 각 학생이 자기 PC에서 직접 실행해야 합니다. 계속할까요?</p>
+        <div class="quit-actions"><button id="quit-cancel" class="button secondary">취소</button><button id="quit-proceed" class="button danger">종료 전달</button></div>
+      </div>
     </section>
     <p id="message" class="message" aria-live="polite"></p>
   </main>
@@ -47,8 +62,9 @@
   <main id="agent" class="agent hidden">
     <video id="remote-video" autoplay playsinline></video>
     <div id="agent-empty" class="agent-empty"><div class="lock-mark">CC</div><h1>강사 화면을 기다리는 중</h1><p>연결이 유지되는 동안 자동으로 화면이 표시됩니다.</p></div>
+    <div id="lecture-note" class="lecture-note hidden" role="status">이론 모드 · 입력 차단 중 · 비상 해제 <kbd>Ctrl + Shift + F12</kbd></div>
     <div id="input-shield" class="input-shield hidden" tabindex="0">
-      <div class="shield-card"><div class="lock-icon">●</div><h2>이론교육 진행 중</h2><p>강사가 실습 모드로 전환하면 즉시 해제됩니다.</p><kbd>Ctrl + Shift + F12</kbd><small>비상 해제</small></div>
+      <div class="shield-card"><div class="lock-icon">●</div><h2>강의실의 강사를 봐 주세요</h2><p>강사가 설명하는 동안 화면과 입력을 잠시 잠갔습니다. 강사가 실습 모드로 전환하면 즉시 해제됩니다.</p><kbd>Ctrl + Shift + F12</kbd><small>비상 해제</small></div>
     </div>
     <div id="agent-detail" class="agent-status agent-detail" aria-live="polite"></div>
     <div id="agent-status" class="agent-status">연결 중</div>

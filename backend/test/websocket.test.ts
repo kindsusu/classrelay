@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ClassroomState, heartbeatFrame, type ClassroomSnapshot } from "../src/index";
+import { ClassroomState, heartbeatFrame, locksInput, type ClassroomSnapshot, type Mode } from "../src/index";
 
 /** mediaReady is optional here on purpose: hibernation can hand back an attachment serialized before the field existed. */
 interface Attachment { role: "controller" | "agent"; deviceId?: string; connectionId: string; lastSeen: number; mediaReady?: boolean }
@@ -31,6 +31,9 @@ function fixture(snapshot?: ClassroomSnapshot, leaseUntil = 0) {
 }
 
 const locked: ClassroomSnapshot = { revision: 3, mode: "lock", leaseMs: 15_000, stream: { sessionId: "s", trackName: "screen" }, students: [] };
+/** `lecture` is the second input-locking mode; every fail-safe test below runs it against `lock`. */
+const lecturing: ClassroomSnapshot = { ...locked, mode: "lecture" };
+const LOCKING_MODES: Mode[] = ["lecture", "lock"];
 
 describe("Durable Object WebSocket control", () => {
   it("fans out a mode change immediately and redacts the agent roster", async () => {
@@ -200,6 +203,18 @@ describe("student media readiness", () => {
     expect(legacy.attachment.mediaReady).toBe(true);
   });
 
+  it("rejects an inbound quit frame instead of growing a new client message type", async () => {
+    for (const frame of [{ type: "quit" }, { type: "quit", deviceId: "pc-01" }]) {
+      const f = fixture();
+      const agent = agentSocket("pc-01");
+      f.sockets.push(agent);
+      await f.durable.webSocketMessage(agent as never, JSON.stringify(frame));
+      expect([JSON.stringify(frame), agent.closed]).toEqual([JSON.stringify(frame), [1008, "only heartbeat messages are accepted"]]);
+    }
+    expect(heartbeatFrame({ type: "quit" }, "agent")).toBeNull();
+    expect(heartbeatFrame({ type: "quit" }, "controller")).toBeNull();
+  });
+
   it("validates the heartbeat frame contract per role", () => {
     expect(heartbeatFrame({ type: "heartbeat" }, "controller")).toEqual({});
     expect(heartbeatFrame({ type: "heartbeat" }, "agent")).toEqual({});
@@ -209,5 +224,159 @@ describe("student media readiness", () => {
     expect(heartbeatFrame({ type: "state" }, "agent")).toBeNull();
     expect(heartbeatFrame(null, "agent")).toBeNull();
     expect(heartbeatFrame("heartbeat", "agent")).toBeNull();
+  });
+});
+
+describe("lecture inherits every lock fail-safe", () => {
+  it("fans out a lecture command, arms the lease alarm, and keeps the roster private", async () => {
+    const f = fixture();
+    const controller = new FakeSocket({ role: "controller", connectionId: "c", lastSeen: 1 });
+    const agent = new FakeSocket({ role: "agent", deviceId: "pc-01", connectionId: "a", lastSeen: 2 });
+    f.sockets.push(controller, agent);
+    const response = await f.durable.fetch(new Request("https://state.internal/mode", { method: "POST", body: JSON.stringify({ mode: "lecture", stream: lecturing.stream }) }));
+    expect(response.status).toBe(200);
+    expect(JSON.parse(controller.sent.at(-1)!).state).toMatchObject({ mode: "lecture", stream: lecturing.stream, students: [{ deviceId: "pc-01" }] });
+    expect(JSON.parse(agent.sent.at(-1)!).state).toMatchObject({ mode: "lecture", stream: lecturing.stream, students: [] });
+    expect(JSON.parse(agent.sent.at(-1)!).state.leaseMs).toBeGreaterThan(0);
+    expect(f.alarmAt).toBeGreaterThan(Date.now());
+    expect(await f.values.get("leaseUntil")).toBeGreaterThan(Date.now());
+  });
+
+  it("rejects quit and every other unknown name as a class mode", async () => {
+    const f = fixture();
+    for (const mode of ["quit", "Lecture", "unlock"]) {
+      const response = await f.durable.fetch(new Request("https://state.internal/mode", { method: "POST", body: JSON.stringify({ mode }) }));
+      expect([mode, response.status]).toEqual([mode, 400]);
+    }
+    expect(f.values.get("snapshot")).toBeUndefined();
+  });
+
+  it("releases an expired lecture on an agent heartbeat exactly as it releases a lock", async () => {
+    const outcomes: ClassroomSnapshot[] = [];
+    for (const mode of LOCKING_MODES) {
+      const f = fixture({ ...locked, mode }, Date.now() - 1);
+      const agent = agentSocket("pc-01");
+      f.sockets.push(agent);
+      await f.durable.webSocketMessage(agent as never, JSON.stringify({ type: "heartbeat" }));
+      const pushed = JSON.parse(agent.sent.at(-1)!).state as ClassroomSnapshot;
+      expect(pushed).toMatchObject({ revision: 4, mode: "practice", leaseMs: 0, stream: null });
+      expect(locksInput(pushed.mode)).toBe(false);
+      expect(f.values.get("snapshot")).toMatchObject({ mode: "practice", stream: null });
+      outcomes.push({ ...pushed, students: [] });
+    }
+    expect(outcomes[0]).toEqual(outcomes[1]);
+  });
+
+  it("releases an expired lecture from the alarm path", async () => {
+    vi.setSystemTime(new Date("2026-09-17T12:00:00Z"));
+    const f = fixture(lecturing, Date.now() - 1);
+    const agent = agentSocket("pc-01");
+    f.sockets.push(agent);
+    await f.durable.alarm();
+    expect(JSON.parse(agent.sent.at(-1)!).state).toMatchObject({ revision: 4, mode: "practice", leaseMs: 0, stream: null });
+    vi.useRealTimers();
+  });
+
+  it("releases a lecture when the active controller socket closes or errors", async () => {
+    for (const hangUp of ["webSocketClose", "webSocketError"] as const) {
+      const f = fixture(lecturing, Date.now() + 10_000);
+      f.values.set("activeControllerConnectionId", "live");
+      const agent = agentSocket("pc-01");
+      const controller = new FakeSocket({ role: "controller", connectionId: "live", lastSeen: 1 });
+      f.sockets.push(agent, controller);
+      await f.durable[hangUp](controller as never);
+      expect([hangUp, JSON.parse(agent.sent.at(-1)!).state.mode]).toEqual([hangUp, "practice"]);
+      expect(JSON.parse(agent.sent.at(-1)!).state).toMatchObject({ revision: 4, stream: null });
+      expect(await f.values.get("leaseUntil")).toBe(0);
+    }
+  });
+
+  it("keeps an unexpired lecture and only its remaining lease across hibernation", async () => {
+    vi.setSystemTime(new Date("2026-09-17T12:00:00Z"));
+    const f = fixture(lecturing, Date.now() + 7_500);
+    f.sockets.push(agentSocket("pc-01"));
+    const state = await (await f.durable.fetch(new Request("https://state.internal/state"))).json() as ClassroomSnapshot;
+    expect(state).toMatchObject({ revision: 3, mode: "lecture", leaseMs: 7_500, stream: lecturing.stream });
+    expect(f.values.get("snapshot")).toEqual(lecturing);
+    vi.useRealTimers();
+  });
+
+  it("keeps revision monotonic across a lecture command and its release", async () => {
+    const f = fixture(lecturing, Date.now() + 10_000);
+    await f.durable.fetch(new Request("https://state.internal/mode", { method: "POST", body: JSON.stringify({ mode: "lecture", stream: lecturing.stream }) }));
+    expect((f.values.get("snapshot") as ClassroomSnapshot).revision).toBe(4);
+    f.values.set("leaseUntil", Date.now() - 1);
+    const released = await (await f.durable.fetch(new Request("https://state.internal/state"))).json() as ClassroomSnapshot;
+    expect(released).toMatchObject({ revision: 5, mode: "practice" });
+    expect(((await (await f.durable.fetch(new Request("https://state.internal/state"))).json()) as ClassroomSnapshot).revision).toBe(5);
+  });
+});
+
+describe("agent quit fanout", () => {
+  const quit = () => new Request("https://state.internal/agents/quit", { method: "POST" });
+
+  it("messages every agent socket, never a controller, and reports the count", async () => {
+    const f = fixture();
+    const controller = new FakeSocket({ role: "controller", connectionId: "c", lastSeen: 1 });
+    const agents = ["pc-01", "pc-02", "pc-03"].map((id) => agentSocket(id));
+    f.sockets.push(controller, ...agents);
+    const response = await f.durable.fetch(quit());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, notified: 3 });
+    for (const agent of agents) expect(agent.sent.map((frame) => JSON.parse(frame))).toEqual([{ type: "quit" }]);
+    expect(controller.sent).toEqual([]);
+    expect(agents.every((a) => a.closed === null)).toBe(true);
+  });
+
+  it("reports zero when no agent is connected", async () => {
+    const f = fixture();
+    f.sockets.push(new FakeSocket({ role: "controller", connectionId: "c", lastSeen: 1 }));
+    expect(await (await f.durable.fetch(quit())).json()).toEqual({ ok: true, notified: 0 });
+  });
+
+  it("does not count a socket it could not message or one without an identity", async () => {
+    const f = fixture();
+    const healthy = agentSocket("pc-01");
+    const broken = agentSocket("pc-02");
+    broken.send = () => { throw new Error("closing"); };
+    const anonymous = new FakeSocket(null as never);
+    f.sockets.push(healthy, broken, anonymous);
+    expect(await (await f.durable.fetch(quit())).json()).toEqual({ ok: true, notified: 1 });
+    expect(healthy.sent.map((frame) => JSON.parse(frame))).toEqual([{ type: "quit" }]);
+  });
+
+  it("writes nothing to storage and leaves mode, revision, lease and stream untouched", async () => {
+    const leaseUntil = Date.now() + 10_000;
+    const f = fixture(lecturing, leaseUntil);
+    f.sockets.push(agentSocket("pc-01"));
+    const before = await (await f.durable.fetch(new Request("https://state.internal/state"))).json() as ClassroomSnapshot;
+    const storedBefore = JSON.stringify([...f.values.entries()]);
+    await f.durable.fetch(quit());
+    expect(JSON.stringify([...f.values.entries()])).toBe(storedBefore);
+    expect(storedBefore.includes("quit")).toBe(false);
+    const after = await (await f.durable.fetch(new Request("https://state.internal/state"))).json() as ClassroomSnapshot;
+    expect({ ...after, leaseMs: 0 }).toEqual({ ...before, leaseMs: 0 });
+    expect(after).toMatchObject({ revision: 3, mode: "lecture", stream: lecturing.stream });
+    expect(after.leaseMs).toBeGreaterThan(0);
+    expect(await f.values.get("leaseUntil")).toBe(leaseUntil);
+  });
+
+  it("never reaches an agent that attaches after the command, and is not replayed by a state push", async () => {
+    const f = fixture(lecturing, Date.now() + 10_000);
+    const present = agentSocket("pc-01");
+    f.sockets.push(present);
+    expect(await (await f.durable.fetch(quit())).json()).toEqual({ ok: true, notified: 1 });
+    const late = agentSocket("pc-99");
+    f.sockets.push(late);
+    // Everything the Durable Object pushes from here on is state only; the command left no trace to replay.
+    await f.durable.webSocketMessage(late as never, JSON.stringify({ type: "heartbeat", mediaReady: true }));
+    await f.durable.fetch(new Request("https://state.internal/mode", { method: "POST", body: JSON.stringify({ mode: "lock", stream: locked.stream }) }));
+    await f.durable.alarm();
+    expect(late.sent.length).toBeGreaterThan(0);
+    expect(late.sent.map((frame) => JSON.parse(frame).type as string)).toEqual(late.sent.map(() => "state"));
+    expect(late.sent.some((frame) => frame.includes("quit"))).toBe(false);
+    // A second command is a fresh fanout over the sockets connected at that instant.
+    expect(await (await f.durable.fetch(quit())).json()).toEqual({ ok: true, notified: 2 });
+    expect(late.sent.filter((frame) => JSON.parse(frame).type === "quit").length).toBe(1);
   });
 });

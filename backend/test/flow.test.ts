@@ -3,10 +3,24 @@ import worker, { ClassroomState, type Env } from '../src/index';
 
 afterEach(() => vi.unstubAllGlobals());
 
+/** Minimal stand-in for a hibernation-capable socket so route tests can observe a real fanout. */
+class FakeSocket {
+  sent: string[] = [];
+  constructor(public attachment: { role: 'controller' | 'agent'; deviceId?: string; connectionId: string; lastSeen: number; mediaReady: boolean }) {}
+  deserializeAttachment() { return this.attachment; }
+  serializeAttachment(value: FakeSocket['attachment']) { this.attachment = structuredClone(value); }
+  send(value: string) { this.sent.push(value); }
+  close() {}
+  frames() { return this.sent.map((frame) => JSON.parse(frame) as { type: string }); }
+}
+function fakeAgent(deviceId: string) {
+  return new FakeSocket({ role: 'agent', deviceId, connectionId: `c-${deviceId}`, lastSeen: Date.now(), mediaReady: false });
+}
+
 async function fixture() {
   const values = new Map<string, unknown>();
   let alarmAt: number | null = null;
-  const sockets: WebSocket[] = [];
+  const sockets: FakeSocket[] = [];
   let ready: Promise<unknown> = Promise.resolve();
   const durable = new ClassroomState({
     storage: {
@@ -44,7 +58,7 @@ async function fixture() {
     return Response.json({ tracks: payload.tracks || [] });
   });
   vi.stubGlobal('fetch', upstream);
-  return { values, request, upstream, get alarmAt() { return alarmAt; } };
+  return { values, request, upstream, sockets, get alarmAt() { return alarmAt; } };
 }
 
 const OFFER = { sessionDescription: { type: 'offer', sdp: 'mock-offer' } };
@@ -103,4 +117,69 @@ it('registers session ownership from a creation response that also carries the a
   expect((await request('/api/rtc/sessions/s1/tracks', 'controller', 'POST', {
     tracks: [{ location: 'local', kind: 'video', mid: '0', trackName: 'screen' }]
   })).status).toBe(200);
+});
+
+type Request_ = Awaited<ReturnType<typeof fixture>>['request'];
+async function publishedStream(request: Request_) {
+  expect((await request('/api/rtc/sessions', 'controller', 'POST', OFFER)).status).toBe(201);
+  expect((await request('/api/rtc/sessions/s1/tracks', 'controller', 'POST', {
+    tracks: [{ location: 'local', kind: 'video', mid: '0', trackName: 'screen' }]
+  })).status).toBe(200);
+  return { sessionId: 's1', trackName: 'screen' };
+}
+
+it('accepts lecture only with a published instructor stream and releases it on lease expiry', async () => {
+  const { request, values } = await fixture();
+  expect((await request('/api/mode', 'controller', 'POST', { mode: 'lecture' })).status).toBe(400);
+  expect((await request('/api/mode', 'controller', 'POST', { mode: 'lecture', stream: { sessionId: 'ghost', trackName: 'screen' } })).status).toBe(403);
+  const stream = await publishedStream(request);
+  const applied = await request('/api/mode', 'controller', 'POST', { mode: 'lecture', stream });
+  expect(applied.status).toBe(200);
+  expect(await applied.json()).toMatchObject({ mode: 'lecture', stream });
+  expect(values.get('leaseUntil') as number).toBeGreaterThan(Date.now());
+  // A lecture that outlives its lease must fall back to practice exactly like a lock.
+  values.set('leaseUntil', Date.now() - 1);
+  expect(await (await request('/api/state')).json()).toMatchObject({ mode: 'practice', leaseMs: 0, stream: null });
+  // And a student can no longer subscribe to the released stream.
+  expect((await request('/api/rtc/sessions', 'a', 'POST', OFFER)).status).toBe(409);
+});
+
+it('rejects an unknown mode name, quit included, before touching the state machine', async () => {
+  const { request, values } = await fixture();
+  for (const mode of ['quit', 'Lecture', 'watch', '', null]) {
+    expect([mode, (await request('/api/mode', 'controller', 'POST', { mode })).status]).toEqual([mode, 400]);
+  }
+  expect(values.get('snapshot')).toBeUndefined();
+});
+
+it('quits every connected agent, never the controller, and changes no class state', async () => {
+  const { request, values, sockets } = await fixture();
+  const stream = await publishedStream(request);
+  expect((await request('/api/mode', 'controller', 'POST', { mode: 'lecture', stream })).status).toBe(200);
+  const controllerSocket = new FakeSocket({ role: 'controller', connectionId: 'c', lastSeen: Date.now(), mediaReady: false });
+  const agents = ['a', 'b'].map(fakeAgent);
+  sockets.push(controllerSocket, ...agents);
+  const before = await (await request('/api/state')).json() as { revision: number; mode: string; stream: unknown; leaseMs: number };
+  const quit = await request('/api/agents/quit', 'controller', 'POST', {});
+  expect(quit.status).toBe(200);
+  expect(await quit.json()).toEqual({ ok: true, notified: 2 });
+  for (const agent of agents) expect(agent.frames()).toEqual([{ type: 'quit' }]);
+  expect(controllerSocket.sent).toEqual([]);
+  const after = await (await request('/api/state')).json() as typeof before;
+  expect({ revision: after.revision, mode: after.mode, stream: after.stream }).toEqual({ revision: before.revision, mode: before.mode, stream: before.stream });
+  expect(after.leaseMs).toBeGreaterThan(0);
+  // Nothing about the command is persisted, so nothing can be replayed to a device that connects later.
+  expect(JSON.stringify([...values.entries()]).includes('quit')).toBe(false);
+});
+
+it('lets only the controller ask the student apps to quit, and only with an empty body', async () => {
+  const { request, sockets } = await fixture();
+  const agent = fakeAgent('a');
+  sockets.push(agent);
+  expect((await request('/api/agents/quit', 'a', 'POST', {})).status).toBe(403);
+  expect((await request('/api/agents/quit', 'b', 'POST', {})).status).toBe(403);
+  expect((await request('/api/agents/quit', 'controller', 'POST', { mode: 'lock' })).status).toBe(400);
+  expect(agent.sent).toEqual([]);
+  expect((await request('/api/agents/quit', 'controller', 'POST', {})).status).toBe(200);
+  expect(agent.frames()).toEqual([{ type: 'quit' }]);
 });

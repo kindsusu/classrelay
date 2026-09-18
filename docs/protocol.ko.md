@@ -35,7 +35,7 @@ Agent는 자신의 영상 수신 상태를 실어 같은 frame을 보낼 수 있
 { "type": "heartbeat", "mediaReady": true }
 ```
 
-클라이언트 메시지로 허용하는 것은 이 두 frame뿐이다. Controller가 `mediaReady`를 보내거나, 다른 key가 하나라도 더 있거나, `mediaReady`가 boolean이 아니면 1008 `only heartbeat messages are accepted`로 닫는다. 1,024바이트를 넘는 frame은 1009 `message too large`로 닫는다.
+클라이언트 메시지로 허용하는 것은 이 두 frame뿐이다. Controller가 `mediaReady`를 보내거나, 다른 key가 하나라도 더 있거나, `mediaReady`가 boolean이 아니면 1008 `only heartbeat messages are accepted`로 닫는다. 1,024바이트를 넘는 frame은 1009 `message too large`로 닫는다. 서버가 보내는 frame은 `state`와 아래에 설명하는 `quit` 두 종류뿐이다. 둘 다 클라이언트→서버 대응 frame이 없으며, 클라이언트가 `{"type":"quit"}`을 보내면 다른 미지의 frame과 똑같이 닫힌다.
 
 Controller heartbeat는 15초 서버 lease를 갱신한다. Agent heartbeat는 presence를 갱신한다. Durable Object socket의 직렬화 attachment에는 `{ role, deviceId?, connectionId, lastSeen, mediaReady }`를 넣으며 Bearer token이나 SFU 비밀은 넣지 않는다. `mediaReady` 도입 전에 직렬화된 attachment는 거부하지 않고 `false`로 읽어, 배포 때문에 살아 있는 학생 연결이 끊기지 않게 한다. WebSocket hibernation은 이 attachment를 보존한다. 유효한 강사 lease는 만료·새 명령·새 강사 연결이 새 세션을 시작하기 전 활성 명령을 안전하게 해제하는 경우까지 유지되며, hibernation이 lease를 초기화하는 것은 아니다. 정상 동작에서 앱은 REST 상태·heartbeat 경로를 폴링하지 않는다.
 
@@ -45,9 +45,44 @@ roster의 각 항목은 `mediaReady`를 boolean으로 보고한다. 기기가 �
 
 `mediaReady`는 학생 본인의 영상 수신에 대한 생존·진단 신호일 뿐이다. 그 Agent가 지금 강사 영상을 받고 있는지만 알린다. 화면 내용도 썸네일도 아니고 학생 활동에 대한 telemetry도 아니다. 학생 PC의 화면·파일·입력은 어떤 것도 수집하거나 전송하지 않는다. presence metadata이므로 `mode`·강사 lease·`revision`에 전혀 영향을 주지 않는다.
 
-`mode`는 `practice`, `broadcast`, `lock` 중 하나다. `broadcast`와 `lock`은 등록된 강사 세션의 성공한 영상 트랙을 필요로 한다. `practice`에서 `stream`은 null이다.
+## 수업 모드
+
+`mode`는 네 가지 wire 이름 중 하나다. 구분 기준은 두 가지뿐이다. 학생 기기에 강사 화면이 보이는지, 그리고 학생 입력을 잠그는지다.
+
+| `mode` | 강사 화면 표시 | 학생 입력 잠금 | `stream` | 용도 |
+|---|---|---|---|---|
+| `practice` | 아니오 | 아니오 | null | 학생이 자유롭게 실습한다. 영상을 publish도 subscribe도 하지 않는다. |
+| `broadcast` | 예 | 아니오 | 필수 | 학생이 강사 화면을 보면서 자기 기기에서 계속 작업한다. |
+| `lecture` | 예 | 예 | 필수 | 보기 전용. 강사 화면을 보며 타이핑·클릭은 할 수 없다. |
+| `lock` | 아니오 — 의도적으로 가린다 | 예 | 필수 | 입력을 잠그고 화면도 가려, 학생이 모니터가 아니라 교실의 강사를 보게 한다. |
+
+입력을 잠그는 모드는 `lecture`와 `lock`이다. 백엔드는 모드 이름을 직접 비교하지 않고 `locksInput(mode)` 술어 하나로만 이를 판단한다. `broadcast`·`lecture`·`lock`은 모두 등록된 강사 세션의 성공한 영상 트랙을 필요로 한다. `stream`이 null인 모드는 `practice`뿐이며, 모든 해제가 되돌아가는 fail-safe 기본값이다.
+
+`practice`가 아닌 모든 모드는 15초 강사 lease를 쥐고, 같은 방식으로 `practice`로 해제된다 — lease 만료, Durable Object alarm, 비상 해제, 강사 연결 종료, 새 강사 연결. `lecture`도 예외 없이 이를 그대로 물려받는다. lease보다 오래 살아남은 `lecture`는 `lock`과 똑같이 더 높은 revision과 비워진 stream을 가진 `practice`가 된다.
 
 `revision`은 강사 명령 변경·서버 안전 해제 시 증가하고 heartbeat로는 증가하지 않는다. 학생의 비상 해제는 같은 revision에 적용되는 잠금 해제 상태로 유지한다. 재연결, 오래된 상태, lease 만료 뒤 응답으로 해제된 명령을 다시 잠그지 않고 더 높은 revision의 새 강사 명령을 기다린다.
+
+## 학생 앱 종료 명령
+
+`POST /api/agents/quit`은 빈 JSON body(`{}`)를 받는 강사 전용 경로다. Durable Object는 연결된 모든 **Agent** socket에 아래 frame을 보내고, Controller socket에는 보내지 않는다.
+
+```json
+{ "type": "quit" }
+```
+
+정확히 이 frame을 받은 Agent는 자기 앱을 종료한다. key가 하나라도 더 붙은 frame은 quit frame이 아니므로 무시한다. 그래서 나중에 서버가 필드를 추가해도 종료 명령으로 오인될 수 없다. 응답은 frame을 보낸 Agent socket 수를 알린다.
+
+```json
+{ "ok": true, "notified": 30 }
+```
+
+학생 토큰으로 이 경로를 호출하면 403 `controller role required`로 거부한다. key가 있는 body는 400으로 거부하므로, 이 경로에 암묵적 파라미터가 생길 수 없다.
+
+**이 명령은 일회성이며 어디에도 저장하지 않는다** — snapshot에도, Durable Object storage에도, socket attachment에도 넣지 않는다. 그 순간 연결돼 있는 Agent socket에만 보내고 끝내는 fire-and-forget fanout이다. 명령이 나간 *뒤에* 접속한 학생 앱은 이 명령을 받지 않으며 종료되지 않는다. 따라서 `notified`는 그 순간 살아 있던 socket 수일 뿐이고, socket 구성이 달라진 뒤 다시 호출하면 다른 수가 나온다.
+
+종료는 수업 모드가 아니며 `mode`·`revision`·`leaseMs`·`stream`·강사 lease를 건드리지 않는다. fail-safe 상태 기계와 직교하며, `/api/mode`에 `{"mode": "quit"}`을 보내면 400 `invalid mode`로 거부한다.
+
+**강사가 학생 앱을 원격으로 다시 실행할 수는 없다.** 이 명령에는 대응되는 반대 명령이 없다. ClassRelay에는 학생 애플리케이션을 실행·재시작·기동하는 기능이 없고, 학생 기기에서 실행 명령을 기다리는 것도 없다. 학생 앱이 한 번 종료되면 그 기기에서 사람이 직접 다시 실행하거나, 조직이 설정한 자동 시작 정책에 따라 다음 Windows 로그인 때 다시 시작된다. 수업 중 일시적인 조치가 아니라 수업을 끝낼 때 쓴다.
 
 ## REST·RTC 경로
 
@@ -58,6 +93,7 @@ roster의 각 항목은 `mediaReady`를 boolean으로 보고한다. 기기가 �
 | GET `/api/state` | 강사·학생 | 기존 호환성·진단용 상태 조회 |
 | POST `/api/heartbeat` | 강사·학생 | 기존 호환성·진단용 presence/lease 갱신 |
 | POST `/api/mode` | 강사 | HTTPS 동작: `{mode, stream?}`으로 모드 변경 |
+| POST `/api/agents/quit` | 강사 | HTTPS 동작: 빈 `{}` body; 연결된 학생 앱 전부에 종료를 요청하고 `{ok, notified}`를 반환 |
 | GET `/api/ice` | 강사·학생 | STUN 및 선택적 단기 TURN 자격증명 |
 | POST `/api/rtc/sessions` | 강사·학생 | SFU 세션 생성; body에 `{sessionDescription: {type: "offer", sdp}}`를 실어야 하고 응답이 answer를 돌려준다 |
 | POST `/api/rtc/sessions/:id/tracks` | 세션 소유자 | 강사는 local video publish, 학생은 active remote video subscribe |
