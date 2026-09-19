@@ -37,7 +37,11 @@ Agent는 자신의 영상 수신 상태를 실어 같은 frame을 보낼 수 있
 
 클라이언트 메시지로 허용하는 것은 이 두 frame뿐이다. Controller가 `mediaReady`를 보내거나, 다른 key가 하나라도 더 있거나, `mediaReady`가 boolean이 아니면 1008 `only heartbeat messages are accepted`로 닫는다. 1,024바이트를 넘는 frame은 1009 `message too large`로 닫는다. 서버가 보내는 frame은 `state`와 아래에 설명하는 `quit` 두 종류뿐이다. 둘 다 클라이언트→서버 대응 frame이 없으며, 클라이언트가 `{"type":"quit"}`을 보내면 다른 미지의 frame과 똑같이 닫힌다.
 
-Controller heartbeat는 15초 서버 lease를 갱신한다. Agent heartbeat는 presence를 갱신한다. Durable Object socket의 직렬화 attachment에는 `{ role, deviceId?, connectionId, lastSeen, mediaReady }`를 넣으며 Bearer token이나 SFU 비밀은 넣지 않는다. `mediaReady` 도입 전에 직렬화된 attachment는 거부하지 않고 `false`로 읽어, 배포 때문에 살아 있는 학생 연결이 끊기지 않게 한다. WebSocket hibernation은 이 attachment를 보존한다. 유효한 강사 lease는 만료·새 명령·새 강사 연결이 새 세션을 시작하기 전 활성 명령을 안전하게 해제하는 경우까지 유지되며, hibernation이 lease를 초기화하는 것은 아니다. 정상 동작에서 앱은 REST 상태·heartbeat 경로를 폴링하지 않는다.
+Controller heartbeat는 15초 서버 lease를 갱신한다. Agent heartbeat는 presence를 갱신한다. Durable Object socket의 직렬화 attachment에는 `{ role, deviceId?, connectionId, lastSeen, mediaReady }`를 넣으며 Bearer token이나 SFU 비밀은 넣지 않는다. `mediaReady` 도입 전에 직렬화된 attachment는 거부하지 않고 `false`로 읽어, 배포 때문에 살아 있는 학생 연결이 끊기지 않게 한다.
+
+**attachment는 heartbeat마다 다시 쓰지 않는다.** `mediaReady`는 값이 바뀌는 그 순간에만 저장하므로 강사가 보는 영상 수신 수는 뒤처지지 않는다. `lastSeen`은 저장된 값으로부터 7.5초가 지난 첫 heartbeat에 저장하며, 5초 주기에서는 두 번째 heartbeat마다다. 따라서 보고되는 `lastSeen`은 실제 시각보다 최대 약 10초 뒤처질 수 있다. 이 지연은 의도한 것이고 상한이 있다. 강사가 `lastSeen`에 적용하는 15초 생존 판정 기준보다 heartbeat 주기 하나만큼 안쪽이라 정상 학생이 접속 수에서 깜빡이지 않으며, Durable Object attachment write는 절반이 된다. `lastSeen`은 "최근 10초 안에 살아 있었다"로 읽고 마지막 heartbeat의 정확한 시각으로 읽지 않는다. heartbeat 주기도, 강사 lease 갱신도 바뀌지 않았다. lease 만료 시각은 여전히 Controller heartbeat마다 저장한다. 저장된 만료 시각이 마지막 heartbeat보다 뒤처지면 살아 있는 lease가 일찍 만료되기 때문이다.
+
+WebSocket hibernation은 이 attachment를 보존한다. 유효한 강사 lease는 만료·새 명령·새 강사 연결이 새 세션을 시작하기 전 활성 명령을 안전하게 해제하는 경우까지 유지되며, hibernation이 lease를 초기화하는 것은 아니다. 정상 동작에서 앱은 REST 상태·heartbeat 경로를 폴링하지 않는다.
 
 ## 학생 영상 수신 표시
 

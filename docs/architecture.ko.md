@@ -41,7 +41,7 @@ flowchart LR
 
 - 제어 상태는 인증된 WebSocket `GET /api/connect`으로 한다. Durable Object는 연결 직후와 상태 변경마다 `{ "type": "state", "state": snapshot }`을 보낸다. Controller와 Agent는 5초마다 `{ "type": "heartbeat" }`을 보내며, Agent는 그 프레임에 `mediaReady`를 실을 수 있다. 앱의 지속적인 상태 폴링 없이도 상태 전달과 명시적 생존 확인을 유지한다.
 - `GET /api/state`, `POST /api/heartbeat`는 기존 REST 호환성과 진단용으로 남긴다. 정상 제어 전달에는 앱이 WebSocket을 사용한다.
-- Controller는 mode·quit·RTC 동작을 인증된 HTTPS endpoint로 보내고 Worker는 결과 상태를 WebSocket으로 전송한다. SQLite 기반 Durable Object 하나가 교실 하나의 명령 상태, 강사 lease, 장비 presence, WebSocket 연결을 관리한다. WebSocket hibernation과 인증된 role·해당 시 device ID·connection ID·last-seen timestamp·media-ready 플래그를 담은 직렬화 attachment를 사용한다. hibernation은 연결 식별을 보존할 뿐 유효한 강사 lease를 초기화하지 않는다. `mediaReady`가 생기기 전에 직렬화된 attachment는 거부하지 않고 `false`로 읽으므로 배포가 살아 있는 학생 연결을 끊지 않는다.
+- Controller는 mode·quit·RTC 동작을 인증된 HTTPS endpoint로 보내고 Worker는 결과 상태를 WebSocket으로 전송한다. SQLite 기반 Durable Object 하나가 교실 하나의 명령 상태, 강사 lease, 장비 presence, WebSocket 연결을 관리한다. WebSocket hibernation과 인증된 role·해당 시 device ID·connection ID·last-seen timestamp·media-ready 플래그를 담은 직렬화 attachment를 사용한다. hibernation은 연결 식별을 보존할 뿐 유효한 강사 lease를 초기화하지 않는다. `mediaReady`가 생기기 전에 직렬화된 attachment는 거부하지 않고 `false`로 읽으므로 배포가 살아 있는 학생 연결을 끊지 않는다. attachment를 heartbeat마다 다시 쓰지는 않는다. `mediaReady`는 값이 바뀌는 즉시, `lastSeen`은 두 번째 heartbeat마다 쓴다. 저장된 값은 강사의 roster 판정 기준 안에 머물면서 Durable Object write는 절반이 된다. 5초 heartbeat 주기와 강사 lease 갱신은 그대로다.
 - 강사 lease는 15초다. 강사의 heartbeat가 이를 갱신한다. 만료가 관찰되면 Durable Object는 실습 상태로 바꾸고 stream을 지우며 revision을 올린 뒤 상태를 전송한다. `expireLease()`는 `broadcast`·`lecture`·`lock`을 가리지 않고 명령된 모든 모드를 해제한다. Agent의 독립적인 로컬 watchdog은 유효한 제어 상태를 local lease 안에 받지 못하면 화면 표시와 입력 guard를 해제한다.
 - 실습 전환, lease 만료, 비상 해제는 해당 revision에서 해제 상태로 남아야 한다. 재연결, 오래된 상태, 서버 응답으로 다시 잠기면 안 된다. 더 높은 revision의 새 강사 명령만 다시 잠글 수 있다.
 - 멈춘 화면은 정상 잠금이 아니라 장애로 취급한다. 디코딩된 프레임의 최신성이 학생의 media-ready 신호를 결정한다. 일정 시간 이상 정체되면 신호가 꺼지고, 그러면 main 프로세스가 네이티브 잠금을 갱신하지 않으며 해당 revision에 해제가 latch된다.
@@ -82,6 +82,8 @@ Worker가 가진 TURN 자격증명이 거절되거나 잘못 설정되면 **502*
 실습 전환은 화면 송출 자원을 정리하고 학생의 전체화면·입력 억제를 해제한다. 새 강사 연결은 새 세션을 시작하기 전에 활성 명령을 안전하게 해제한다. 강사 앱을 재시작하면 화면 선택 및 송출을 다시 시작한다. 비상 해제는 해당 revision에서 유지되고 다음 새 명령에서만 재개한다.
 
 송출 품질은 선택 항목인 `video` 블록이 장비별로 제한한다. 기본값은 720p·15fps·2,000kbit/s이며 시작 시 검증하므로, 장시간 수업이 대역폭 예산 안에 머물고 수업 중 화면 교체도 이를 우회하지 못한다. `getStats()` 실측값은 강사 화면에만 표시한다. Agent도 수신 영상을 계속 표본화하지만 그 목적은 표시가 아니라 프리즈 감지다.
+
+**무료 플랜에서 가장 빡빡한 자원은 Durable Object SQLite row write이고, 그것을 채우는 것은 socket attachment다.** 31대가 5초마다 heartbeat를 보내는 8시간 수업은 장비당 5,760회, 합계 178,560회이며, 매번 attachment를 쓰면 그것만으로 하루 100,000회 무료 한도를 넘는다. 그래서 꼭 써야 할 때만 쓴다. `mediaReady`는 값이 바뀌는 즉시, `lastSeen`은 두 번째 heartbeat마다 쓴다. 저장된 값이 실제 시각보다 뒤처지는 폭은 약 10초로 묶이며, 이는 강사의 15초 roster 판정 기준보다 heartbeat 주기 하나만큼 안쪽이다. 같은 수업에서 attachment write는 89,280회가 되며, 실제 과금을 볼 때 heartbeat 수와 대조해야 하는 값이 이것이다. 강사 lease 만료 시각은 여기서 제외하며 여전히 Controller heartbeat마다 쓴다(수업당 약 5,760회, 장비 1대). 저장된 만료 시각이 마지막 heartbeat보다 뒤처지면 살아 있는 lease가 일찍 만료되고, lease가 만료되는 시점은 write 수와 바꿀 수 있는 것이 아니다. **이 수치는 공개된 한도에 대한 계산이지 과금 실측이 아니며**, attachment write가 SQLite row write로 과금되는지 자체도 Cloudflare 문서에 명시돼 있지 않다.
 
 학생 30대에 5시간 보내는 영상 payload만 계산하면 학생당 평균 1Mbps에서 약 67.5GB, 2Mbps에서 135GB, 4Mbps에서 270GB다. **이 값은 계산이지 실측이 아니다.** 프로토콜 오버헤드·재전송·TURN relay 트래픽·계정의 다른 사용량이 들어가지 않으며, 이를 대체할 실제 대역폭 실측은 아직 없다. 실제 수업 규모를 잡을 때는 Controller의 실측 표시를 쓴다. 작성 시점의 Cloudflare Realtime SFU·TURN 월 합산 무료량은 1,000GB이지만 요금과 플랜 동작은 바뀔 수 있다. Realtime·Workers·Durable Objects 사용량을 확인하며, 이 추정치를 지출 상한이나 비용 0원 보장으로 해석하지 않는다.
 

@@ -25,6 +25,55 @@ export interface Env {
 interface Principal { role: Role; deviceId?: string }
 interface SocketAttachment extends Principal { connectionId: string; lastSeen: number; mediaReady: boolean }
 const LEASE_MS = 15_000;
+/**
+ * The cadence at which the Controller and every Agent send `{type:"heartbeat"}` (`docs/protocol.md`).
+ * The server never enforces it — it is mirrored here only to derive the attachment write policy below.
+ * It is deliberately three times shorter than LEASE_MS so an expiry needs three consecutive losses;
+ * at 10 s a single lost packet would release the whole class into practice mid-lecture.
+ */
+const HEARTBEAT_MS = 5_000;
+/**
+ * The instructor's roster drops a student whose `lastSeen` is older than this — `ROSTER_CUTOFF_MS` in
+ * `apps/src/renderer.js`, applied to `student.lastSeen` in `summarizeRoster()`. The client stays the
+ * site that enforces it; this mirror exists so the persistence bound below is derived from it rather
+ * than guessed, and `backend/test/heartbeat-writes.test.ts` fails if the two ever drift apart.
+ */
+const ROSTER_CUTOFF_MS = 15_000;
+/**
+ * How stale a *persisted* `lastSeen` may ever be.
+ *
+ * A heartbeat no longer writes the socket attachment every time. At the 5 s cadence, 31 devices for
+ * eight hours was 178,560 attachment writes against a 100,000/day free-plan budget for Durable Object
+ * SQLite row writes. The roster only needs `lastSeen` fresh enough to stay inside ROSTER_CUTOFF_MS, so
+ * the persisted value is allowed to lag — but **never by as much as the cutoff**, or a perfectly healthy
+ * student starts flickering in and out of the instructor's connected count. This bound is two thirds of
+ * the cutoff, leaving a full heartbeat period spare, which also absorbs the skew between the Durable
+ * Object's clock (which stamps `lastSeen`) and the instructor PC's clock (which applies the cutoff).
+ *
+ * **The invariant is `LAST_SEEN_STALENESS_BOUND_MS + HEARTBEAT_MS <= ROSTER_CUTOFF_MS`.** If the cutoff
+ * in the renderer changes, this has to change with it, and that test file holds the coupling.
+ */
+const LAST_SEEN_STALENESS_BOUND_MS = 2 * HEARTBEAT_MS;
+/**
+ * Persist `lastSeen` on the first heartbeat at or after this much time since the persisted value, which
+ * at the 5 s cadence is every second heartbeat: half the writes, and a persisted value refreshed every
+ * ~10 s, i.e. never staler than LAST_SEEN_STALENESS_BOUND_MS. It sits at 1.5 heartbeat periods rather
+ * than exactly 2 on purpose — an exact multiple would let a few milliseconds of heartbeat jitter defer
+ * the write to the *third* heartbeat, ~15 s, the cutoff itself. This leaves 2.5 s of slack for jitter.
+ */
+const LAST_SEEN_PERSIST_AFTER_MS = 1.5 * HEARTBEAT_MS;
+/**
+ * The timings above, for the tests that hold them against `ROSTER_CUTOFF_MS` in `apps/src/renderer.js`.
+ *
+ * A function, not four exported numbers. workerd treats every named export of the entry module as a
+ * service entrypoint and rejects a bare number — `Incorrect type for map entry 'HEARTBEAT_MS': the
+ * provided value is not of type 'function or ExportedHandler'` — which kills the Worker at *startup*,
+ * not at build time, so neither `tsc` nor a bundle check would have caught it. Measured on 2026-09-19
+ * against miniflare's workerd via `scripts/ws-smoke.mjs`, which failed to boot until these went private.
+ */
+export function heartbeatPolicy() {
+  return { heartbeatMs: HEARTBEAT_MS, rosterCutoffMs: ROSTER_CUTOFF_MS, stalenessBoundMs: LAST_SEEN_STALENESS_BOUND_MS, persistAfterMs: LAST_SEEN_PERSIST_AFTER_MS } as const;
+}
 const RTC_BASE = "https://rtc.live.cloudflare.com/v1/apps";
 
 export function authenticate(request: Request, env: Pick<Env, "CONTROLLER_TOKEN" | "AGENT_TOKENS_JSON">): Principal | null {
@@ -75,6 +124,25 @@ export function heartbeatFrame(payload: unknown, role: Role): { mediaReady?: boo
   // A controller receives no video, so accepting mediaReady from it would be a silent protocol hole.
   if (keys.length !== 2 || !keys.includes("mediaReady") || typeof frame.mediaReady !== "boolean" || role !== "agent") return null;
   return { mediaReady: frame.mediaReady };
+}
+/**
+ * Whether a heartbeat has to be written back to the socket attachment. Both fields it carries are
+ * presence metadata, but they have different urgency:
+ *
+ * - `mediaReady` persists the instant it changes, and only then. It drives the instructor's
+ *   `연결 N · 영상 M` line — the one signal separating "a control socket is attached" from "this student
+ *   is actually receiving video" — so a stale value there actively misleads during a class. An unchanged
+ *   `mediaReady` is never a reason to write.
+ * - `lastSeen` only has to stay inside LAST_SEEN_STALENESS_BOUND_MS, so it is written on the first
+ *   heartbeat at or after LAST_SEEN_PERSIST_AFTER_MS and skipped in between.
+ *
+ * A persisted timestamp somehow ahead of `now` is rewritten rather than trusted, so a clock that jumped
+ * backwards cannot stall the refresh indefinitely and strand a live student behind the roster cutoff.
+ */
+export function persistsAttachment(persisted: { lastSeen: number; mediaReady: boolean }, next: { lastSeen: number; mediaReady: boolean }): boolean {
+  if (persisted.mediaReady !== next.mediaReady) return true;
+  const elapsed = next.lastSeen - persisted.lastSeen;
+  return elapsed >= LAST_SEEN_PERSIST_AFTER_MS || elapsed < 0;
 }
 function json(data: unknown, status = 200): Response { return Response.json(data, { status, headers: { "Cache-Control": "no-store" } }); }
 function error(message: string, status = 400): Response { return json({ error: message }, status); }
@@ -333,14 +401,18 @@ export class ClassroomState implements DurableObject {
     try { payload = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message)); } catch { socket.close(1008, "invalid JSON"); return; }
     const frame = heartbeatFrame(payload, attachment.role);
     if (!frame) { socket.close(1008, "only heartbeat messages are accepted"); return; }
-    attachment.lastSeen = Date.now();
-    // Presence metadata only: it never touches mode, lease, or revision.
-    if (frame.mediaReady !== undefined) attachment.mediaReady = frame.mediaReady;
-    socket.serializeAttachment(attachment);
+    // Presence metadata only: neither field touches mode, lease, or revision.
+    const next: SocketAttachment = { ...attachment, lastSeen: Date.now(), mediaReady: frame.mediaReady ?? attachment.mediaReady };
+    // Not every heartbeat is written back; persistsAttachment() states which ones must be and why.
+    if (persistsAttachment(attachment, next)) socket.serializeAttachment(next);
     await this.snapshot();
     if (attachment.role === "controller") {
       const active = await this.state.storage.get<string>("activeControllerConnectionId");
       if (active !== attachment.connectionId) { socket.close(1008, "controller connection is no longer active"); return; }
+      // Written on *every* controller heartbeat, deliberately. Skipping one would leave a stored deadline
+      // that lags the last heartbeat, expiring a live lease early and eating the three-loss margin the
+      // 5 s cadence buys against the 15 s lease. One device's lease writes are a rounding error; the
+      // moment a lease expires is not something to trade for them.
       const leaseUntil = Date.now() + LEASE_MS;
       await this.state.storage.put("leaseUntil", leaseUntil);
       await this.state.storage.setAlarm(leaseUntil);
