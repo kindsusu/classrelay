@@ -24,7 +24,7 @@ These are not style preferences. Each one is a rule because breaking it already 
 
 ## Validation
 
-- `npm.cmd test --prefix backend` (61), `npm.cmd run typecheck --prefix backend`, `npm.cmd test --prefix apps` (128), `npm.cmd run check --prefix apps`, `node scripts/ws-smoke.mjs`.
+- `npm.cmd test --prefix backend` (73), `npm.cmd run typecheck --prefix backend`, `npm.cmd test --prefix apps` (143), `npm.cmd run check --prefix apps`, `node scripts/ws-smoke.mjs`.
 - For native changes, run `powershell.exe -NoProfile -File native-input/build.ps1` and `InputGuard.exe --self-test`. Do not inadvertently activate input suppression on the development host. Distinguish simulated tests from actual hardware validation.
 - Build the native helper before `npm.cmd run dist --prefix apps`. Validate the Worker from `backend/` with `npx.cmd wrangler deploy --dry-run`.
 - CI runs all of the above on every push and must stay green. Record real results in `docs/verification.md`, keeping live-deployment measurements, real-hardware observations, and untested behavior in separate sections.

@@ -8,7 +8,7 @@ Screen broadcasting and classroom input control for company-owned Windows traini
 
 ClassRelay is a proof of concept for one instructor and approximately 30 student devices, including devices on different Wi-Fi networks. The instructor selects a screen, presents it fullscreen on student laptops, and can suppress student input while teaching. Practice mode releases the student desktops.
 
-> **Status: PoC.** The backend has been measured against a live deployment and a one-instructor/one-student screen broadcast has run on real hardware. The Windows input lock, the student-app shutdown, live screen switching, real throughput, 30 devices, the five-hour soak, and login auto-start are **not** verified. See [Status](#status). The desktop interface is Korean; repository documentation is English with a matching Korean version.
+> **Status: PoC.** The backend has been measured against a live deployment, a one-instructor/one-student screen broadcast and the student-app shutdown have run on real hardware, and 30 student connections have been held against the live Worker. The Windows input lock, live screen switching, real throughput, 30 real devices, the five-hour soak, and login auto-start are **not** verified. See [Status](#status). The desktop interface is Korean; repository documentation is English with a matching Korean version.
 
 ## Features
 
@@ -18,6 +18,7 @@ ClassRelay is a proof of concept for one instructor and approximately 30 student
 - Authenticated classroom state and signaling through a Worker and a Durable Object.
 - Per-device send-quality caps so a long class stays inside the bandwidth budget.
 - Automatic reconnection and configurable startup after Windows sign-in.
+- Every instructor action is time-bounded — a hung screen capture can no longer leave the buttons dead — and each device runs a single app instance.
 - A 15-second control lease, an independent native watchdog, frozen-video detection, and a `Ctrl+Shift+F12` emergency release.
 - Per-device credentials; permanent SFU/TURN secrets stay on the backend.
 
@@ -199,7 +200,7 @@ npm.cmd run check --prefix apps
 node scripts/ws-smoke.mjs
 ```
 
-Backend tests: 61. Desktop tests: 128. CI on the default branch runs all of the above plus the native helper build, its self-test, and a Worker deployment dry-run, and is green.
+Backend tests: 73. Desktop tests: 143. CI on the default branch runs all of the above plus the native helper build, its self-test, and a Worker deployment dry-run, and is green.
 
 The [verification record](docs/verification.md) separates what was measured against the live deployment, what ran on real hardware, and what remains untested. Follow the [field acceptance checklist](docs/acceptance.md), progressing through 1, 3, 10, and 30 devices.
 
@@ -207,15 +208,17 @@ The [verification record](docs/verification.md) separates what was measured agai
 
 **Measured against the live deployment.** Twenty-one HTTP and WebSocket checks: nine on authentication, roles, roster privacy, and the control socket; twelve on ICE/TURN, covering STUN plus TURN over UDP, TCP, and TLS, credentials differing between consecutive requests, and the permanent key never appearing in a response. TLS validates on the dedicated subdomain.
 
-**Seen on real hardware.** Screen broadcast from one instructor machine to one student machine works.
+**Seen on real hardware.** Screen broadcast from one instructor machine to one student machine works. A two-laptop test on 2026-09-22 surfaced three app-side defects — a student process surviving the quit command, an instructor app whose buttons stayed disabled after a screen capture never returned, and no single-instance lock — all fixed in the app and recorded in the [verification record](docs/verification.md).
+
+**Held against the live Worker.** 30 student tokens connected simultaneously for three minutes with no disconnects and a complete roster throughout; this exercised the control plane only.
 
 **Not verified.** Stated plainly, because none of this has been exercised:
 
 - **The Windows input lock has never engaged.** `nativeInputLock` is `false` on every device configuration, so no lock has ever actually run.
-- The student-app shutdown has never run on a real device.
+- The student-app shutdown has run on one real device only; the forced-exit fallback added afterwards has not been exercised on hardware.
 - Switching the shared screen has not been tried on real hardware.
 - Real throughput. The only figure observed so far — roughly 15 kbps at 1 fps — was a static slide and cannot be used for capacity planning.
-- 30 devices, and the five-hour soak.
+- 30 real devices, and the five-hour soak.
 - Login auto-start.
 - Whether the recent fix removed the reported student-screen flicker.
 

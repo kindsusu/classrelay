@@ -24,7 +24,7 @@
 
 ## 검증
 
-- `npm.cmd test --prefix backend`(61개), `npm.cmd run typecheck --prefix backend`, `npm.cmd test --prefix apps`(128개), `npm.cmd run check --prefix apps`, `node scripts/ws-smoke.mjs`.
+- `npm.cmd test --prefix backend`(73개), `npm.cmd run typecheck --prefix backend`, `npm.cmd test --prefix apps`(143개), `npm.cmd run check --prefix apps`, `node scripts/ws-smoke.mjs`.
 - 네이티브 변경은 `powershell.exe -NoProfile -File native-input/build.ps1`과 `InputGuard.exe --self-test`로 확인한다. 개발 호스트의 입력을 무심코 잠그지 않는다. 모의 테스트와 실장비 검증 결과를 구분한다.
 - 패키징은 native helper 빌드 후 `npm.cmd run dist --prefix apps`. Worker 사전 검증은 backend에서 `npx.cmd wrangler deploy --dry-run`.
 - CI가 위 전부를 모든 push에서 돌리며 통과 상태를 유지해야 한다. 실제 결과는 `docs/verification.ko.md`에 남기되 실배포 실측·실장비 관측·미검증 항목을 각각 다른 절에 적는다.

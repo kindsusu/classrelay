@@ -34,7 +34,10 @@ Complete these before the first check that involves a locking mode.
 | 1 device | Reconnect after network loss | Fresh state is applied; an expired or emergency-released revision does not re-lock |
 | 1 device | Wake a sleeping PC | Connects and fetches fresh pushed state without applying an earlier lock |
 | 1 device | Sign out and sign in | Configured Agent starts automatically and connects |
-| 1 device | 학생 앱 종료 | The student app releases the input guard and kiosk, then exits cleanly; the reported `notified` count matches the connected devices |
+| 1 device | 학생 앱 종료 | The student app releases the input guard and kiosk, then exits cleanly; the reported `notified` count matches the connected devices; **no `ClassRelay` process remains in Task Manager three seconds later** |
+| 1 device | Run `run.bat` twice on one student device | Exactly one instance keeps running; the instructor's roster shows that device once and never flickers |
+| 1 device | Run `run.bat` twice on the instructor device | The existing window comes to the front; no second instructor connection is made |
+| 1 device | Cancel or ignore the screen-capture prompt for more than 10 seconds | The message line reports the capture timeout, the mode buttons are usable again, and no mode was sent |
 | 1 device | Start a student app *after* the shutdown was issued | That device connects normally and does **not** quit; confirm the instructor has no way to restart the others remotely |
 | Authentication | Invalid token, missing device ID, or another student's device ID | 401/403 and no control-state change |
 | Authentication | Student attempts a mode change or a shutdown | 403 and no control-state change |
