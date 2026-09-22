@@ -19,7 +19,9 @@ function loadMainExports() {
       getLoginItemSettings: () => ({ openAtLogin: false }),
       setLoginItemSettings: noop,
       isPackaged: false,
-      quit: noop
+      quit: noop,
+      exit: noop,
+      requestSingleInstanceLock: () => true
     },
     BrowserWindow: class {},
     desktopCapturer: { getSources: async () => [] },

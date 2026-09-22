@@ -273,12 +273,18 @@ function teardown() {
   inputGuard?.stdin?.end();
 }
 
+// app.quit()은 창 닫기 이벤트를 거치는 정중한 종료라 어딘가 한 곳이 붙잡으면 그대로 멈춘다.
+// 실기기에서 송출만 끊기고 프로세스는 살아 있는 학생 앱이 나왔다. 3초 뒤 강제 종료를 보험으로 건다.
+const QUIT_FORCE_EXIT_MS = 3_000;
+
 // 강사의 학생 앱 종료 명령. 입력 보호 해제와 kiosk 해제가 끝난 뒤에만 종료한다.
 function handleQuitCommand() {
   if (config?.role !== 'agent') return;
   teardown();
   send('agent:notice', '강사가 앱 종료를 요청했습니다. 입력 차단을 해제하고 종료합니다.');
   app.quit();
+  // unref로 정상 종료를 붙잡지 않게 한다. 제때 끝나는 앱은 이 타이머를 기다리지 않고 나간다.
+  setTimeout(() => app.exit(0), QUIT_FORCE_EXIT_MS).unref?.();
 }
 
 function acceptControlState(state) {
@@ -410,35 +416,49 @@ function registerIpc() {
   });
 }
 
-app.whenReady().then(() => {
-  try { config = readConfig(); }
-  catch (error) {
-    config = { role: 'controller', deviceId: 'invalid', backendUrl: 'http://localhost', token: '' };
-    app.whenReady().then(() => require('electron').dialog.showErrorBox('설정 오류', error.message));
-    setImmediate(() => app.quit());
-    return;
-  }
-  registerIpc();
-  setupDisplayCapture();
-  createWindow();
-  startInputGuard();
-  globalShortcut.register('CommandOrControl+Shift+F12', () => emergencyUnlock());
-  if (config.autoLaunch === true) configureStartup(true);
-  startControlSocket();
-  watchdogTimer = setInterval(() => {
-    const agent = config.role === 'agent';
-    if (agent && safety.effectiveMode() === 'practice' && safety.mode !== 'practice') emergencyUnlock('15초 연결 제한');
-    const rendererHealthy = performance.now() - lastRendererPulse < 4_000;
-    // effectiveMode()는 조건마다 새로 읽는다. 앞선 emergencyUnlock이 이미 해제했을 수 있고,
-    // 값을 한 번 담아 재사용하면 해제된 직후 tick에서 LOCK을 다시 써 버린다.
-    if (agent && locksInput(safety.effectiveMode()) && !rendererHealthy) emergencyUnlock('화면 프로세스 응답 없음');
-    if (agent && locksInput(safety.effectiveMode()) && rendererHealthy && rendererMediaReady) writeInputGuard(`LOCK ${safety.revision}`);
-    else writeInputGuard('UNLOCK');
-  }, 250);
-});
+// run.bat을 두 번 누르면 같은 deviceId로 두 프로세스가 붙고, 서버는 먼저 붙은 쪽을 1012로 끊는다.
+// 두 인스턴스가 서로를 계속 밀어내며 수업 내내 명령이 오락가락한다. 두 번째 실행은 창도 소켓도
+// IPC도 만들지 않고 즉시 물러난다 — 시작해 버린 뒤 정리하는 것보다 아예 시작하지 않는 편이 안전하다.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  // 학생 앱은 두 번째 실행에 반응하지 않는다. 창을 끌어올리면 수업 중 학생 화면이 튄다.
+  app.on('second-instance', () => {
+    if (config?.role !== 'controller' || !mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
 
-app.on('before-quit', teardown);
-app.on('will-quit', () => globalShortcut.unregisterAll());
-app.on('window-all-closed', () => { if (config?.role !== 'agent') app.quit(); });
+  app.whenReady().then(() => {
+    try { config = readConfig(); }
+    catch (error) {
+      config = { role: 'controller', deviceId: 'invalid', backendUrl: 'http://localhost', token: '' };
+      app.whenReady().then(() => require('electron').dialog.showErrorBox('설정 오류', error.message));
+      setImmediate(() => app.quit());
+      return;
+    }
+    registerIpc();
+    setupDisplayCapture();
+    createWindow();
+    startInputGuard();
+    globalShortcut.register('CommandOrControl+Shift+F12', () => emergencyUnlock());
+    if (config.autoLaunch === true) configureStartup(true);
+    startControlSocket();
+    watchdogTimer = setInterval(() => {
+      const agent = config.role === 'agent';
+      if (agent && safety.effectiveMode() === 'practice' && safety.mode !== 'practice') emergencyUnlock('15초 연결 제한');
+      const rendererHealthy = performance.now() - lastRendererPulse < 4_000;
+      // effectiveMode()는 조건마다 새로 읽는다. 앞선 emergencyUnlock이 이미 해제했을 수 있고,
+      // 값을 한 번 담아 재사용하면 해제된 직후 tick에서 LOCK을 다시 써 버린다.
+      if (agent && locksInput(safety.effectiveMode()) && !rendererHealthy) emergencyUnlock('화면 프로세스 응답 없음');
+      if (agent && locksInput(safety.effectiveMode()) && rendererHealthy && rendererMediaReady) writeInputGuard(`LOCK ${safety.revision}`);
+      else writeInputGuard('UNLOCK');
+    }, 250);
+  });
+
+  app.on('before-quit', teardown);
+  app.on('will-quit', () => globalShortcut.unregisterAll());
+  app.on('window-all-closed', () => { if (config?.role !== 'agent') app.quit(); });
+}
 
 module.exports = { resolveVideoConfig, VIDEO_DEFAULTS, VIDEO_RANGES, describeApiError, API_ERROR_MAX };

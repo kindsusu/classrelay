@@ -15,6 +15,14 @@ const RESUBSCRIBE_BACKOFF_MS = [1_000, 3_000, 6_000];
 const MAX_RESUBSCRIBE_ATTEMPTS = RESUBSCRIBE_BACKOFF_MS.length;
 const ROSTER_CUTOFF_MS = 15_000;
 const SWITCH_CANCELLED = '서버 연결이 바뀌어 화면 교체를 취소했습니다. 송출 상태를 확인하고 다시 시도하세요.';
+// getDisplayMedia는 취소할 수단이 없다. 실기기에서 이 호출이 끝내 돌아오지 않아 /api/ice조차 나가지
+// 않았고, 강사는 버튼이 전부 죽은 앱을 4분 동안 보고 있었다. 기다림에 상한을 두고 강사에게 돌려준다.
+const CAPTURE_TIMEOUT_MS = 10_000;
+// 어떤 동작도 이 시간을 넘기면 강제로 놓아 준다. 버튼이 영원히 잠기는 것보다 취소가 낫다.
+const ACTION_TIMEOUT_MS = 30_000;
+const CAPTURE_TIMEOUT = `화면 캡처가 ${CAPTURE_TIMEOUT_MS / 1_000}초 안에 응답하지 않았습니다. 화면 목록을 새로고침하고 다시 시도하세요. 계속되면 강사 앱을 다시 시작하세요.`;
+const ACTION_TIMEOUT = `동작이 ${ACTION_TIMEOUT_MS / 1_000}초 안에 끝나지 않아 취소했습니다. 다시 시도하세요.`;
+const ACTION_CANCELLED = '시간이 초과되어 송출을 취소했습니다.';
 
 let config;
 let sources = [];
@@ -40,6 +48,10 @@ let agentState = null;
 let agentStreamKey = null;
 let resubscribeTimer = null;
 let resubscribeAttempts = 0;
+// 상한에 걸려 취소한 동작을 무효로 만드는 세대 번호. 뒤늦게 끝난 명령이 지금 수업을 덮으면 안 된다.
+let actionGeneration = 0;
+// 내가 띄운 연결 끊김 문구. 재연결 뒤 그 문구가 그대로 남아 있을 때만 지운다.
+let offlineMessage = '';
 
 function shouldStopPublishingForState(state, publication) {
   return state?.mode === 'practice'
@@ -290,6 +302,27 @@ async function stopPublishing() {
   active.pc.close();
 }
 
+// 멈춘 getDisplayMedia는 취소할 수 없다. 기다림만 끊고 빠져나온 뒤, 상한을 넘겨 도착한 스트림은
+// 아무도 들고 있지 않으므로 그 자리에서 모든 트랙을 멈춘다 — 그러지 않으면 강사 화면이 계속 캡처된다.
+function captureWithTimeout(capture) {
+  let timedOut = false;
+  const guarded = Promise.resolve(capture).then((stream) => {
+    if (timedOut) stream?.getTracks().forEach((track) => track.stop());
+    return stream;
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(CAPTURE_TIMEOUT));
+    }, CAPTURE_TIMEOUT_MS);
+    // 타이머는 결과를 넘기기 전에 지운다. finally로 미루면 호출자가 먼저 깨어나 타이머가 남은 것처럼 보인다.
+    guarded.then(
+      (stream) => { clearTimeout(timer); resolve(stream); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
+}
+
 async function startPublishing() {
   if (publishing) return publishing.descriptor;
   if (!selectedSourceId) throw new Error('먼저 송출할 화면을 선택하세요.');
@@ -298,10 +331,10 @@ async function startPublishing() {
   let stream;
   let pc;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({
+    stream = await captureWithTimeout(navigator.mediaDevices.getDisplayMedia({
       video: { height: { max: video.maxHeight }, frameRate: { ideal: video.maxFps, max: video.maxFps } },
       audio: false
-    });
+    }));
     pc = new RTCPeerConnection(await iceConfiguration());
     const track = stream.getVideoTracks()[0];
     await applyTrackCaps(track, video);
@@ -688,13 +721,35 @@ function renderControllerState(state) {
   }
 }
 
+// 동작이 끝나지 않으면 버튼이 영원히 잠긴다(실기기에서 4분). 상한을 넘기면 버튼을 풀고 그 동작의
+// 세대를 폐기한다 — 뒤늦게 끝난 명령은 broadcast()가 세대를 대조해 스스로 버린다. 폐기된 동작이
+// 나중에 실패해도 문구를 덮지 않고, 버튼도 다시 건드리지 않는다(그새 새 동작이 돌고 있을 수 있다).
 async function withBusy(action) {
-  document.querySelectorAll('.action').forEach((button) => { button.disabled = true; });
-  try { await action(); } catch (error) { message(error.message, true); }
-  finally { document.querySelectorAll('.action').forEach((button) => { button.disabled = false; }); }
+  const buttons = () => document.querySelectorAll('.action');
+  buttons().forEach((button) => { button.disabled = true; });
+  const generation = actionGeneration;
+  let capped = false;
+  const cap = setTimeout(() => {
+    capped = true;
+    if (generation === actionGeneration) actionGeneration += 1;
+    buttons().forEach((button) => { button.disabled = false; });
+    message(ACTION_TIMEOUT, true);
+  }, ACTION_TIMEOUT_MS);
+  try { await action(); }
+  catch (error) { if (!capped) message(error.message, true); }
+  finally {
+    clearTimeout(cap);
+    if (!capped) buttons().forEach((button) => { button.disabled = false; });
+  }
+}
+
+function actionIsCurrent(generation) {
+  return generation === actionGeneration;
 }
 
 async function broadcast(mode) {
+  // withBusy가 세대를 읽은 직후 동기적으로 여기 들어오므로 같은 값이다.
+  const generation = actionGeneration;
   message('화면 송출 연결을 준비하고 있습니다…');
   const connectionGeneration = controllerConnectionGeneration;
   const descriptor = await startPublishing();
@@ -703,7 +758,14 @@ async function broadcast(mode) {
     if (!controllerOnline || connectionGeneration !== controllerConnectionGeneration) {
       throw new Error('서버 연결이 바뀌어 화면 송출 준비를 취소했습니다. 다시 시도하세요.');
     }
+    if (!actionIsCurrent(generation)) throw new Error(ACTION_CANCELLED);
     const state = await api.setMode({ mode, stream: descriptor });
+    if (!actionIsCurrent(generation)) {
+      // 상한이 지난 뒤에야 서버가 받아들였다. 강사는 이미 취소로 알고 있으니 수업을 실습으로 되돌린다.
+      // quiet: 실습 전환 안내가 취소 문구를 덮으면 강사는 무엇이 취소됐는지 모른다.
+      await setPractice({ quiet: true }).catch(() => {});
+      throw new Error(ACTION_CANCELLED);
+    }
     if (publishing !== publication) throw new Error('화면 송출 준비가 취소되었습니다.');
     if (!Number.isSafeInteger(state?.revision)) throw new Error('서버가 유효한 모드 revision을 반환하지 않았습니다.');
     publication.activationRevision = state.revision;
@@ -722,7 +784,7 @@ async function broadcast(mode) {
 
 // background는 강사가 실습 시작을 직접 누른 경우에만 true다. 송출 실패·트랙 종료로 자동 전환된
 // 실습에서 창을 내리면 방금 띄운 오류 메시지가 강사 눈에서 사라진다.
-async function setPractice({ background = false } = {}) {
+async function setPractice({ background = false, quiet = false } = {}) {
   let modeError;
   try { await api.setMode({ mode: 'practice' }); }
   catch (error) { modeError = error; }
@@ -730,7 +792,7 @@ async function setPractice({ background = false } = {}) {
   if (modeError) throw modeError;
   rebroadcastRequired = false;
   showRebroadcastNotice(false);
-  message('모든 학생 PC를 실습 모드로 전환했습니다.');
+  if (!quiet) message('모든 학생 PC를 실습 모드로 전환했습니다.');
   if (background) api.backgroundWindow();
 }
 
@@ -769,24 +831,34 @@ async function initController() {
     message(quitReportMessage(await api.quitAgents()));
   }));
   api.onState(renderControllerState);
-  api.onConnection((state) => {
-    if (state.online) controllerOnline = true;
-    else {
-      controllerOnline = false;
-      controllerConnectionGeneration += 1;
-      if (publishing) {
-        // 재연결만으로 송출이 살아나지 않는다. 강사가 직접 다시 송출해야 한다는 사실을 남긴다.
-        rebroadcastRequired = true;
-        stopPublishing().catch((error) => message(error.message, true));
-      }
-    }
-    showRebroadcastNotice(state.online && rebroadcastRequired);
-    $('connection').textContent = state.online ? '서버 연결됨' : '연결 끊김';
-    $('connection').className = `status ${state.online ? 'status-online' : 'status-offline'}`;
-    if (!state.online && state.message) message(state.message, true);
-  });
+  api.onConnection(handleControllerConnection);
   api.stateReady();
   await refreshSources();
+}
+
+function handleControllerConnection(state) {
+  if (state.online) {
+    controllerOnline = true;
+    // 끊김 문구는 내가 띄운 것이 그대로 남아 있을 때만 지운다. 송출 오류처럼 다른 문구는 강사가 봐야
+    // 한다. 실기기에서 재접속 뒤에도 "서버 연결이 종료되었습니다"가 남아 서버 장애로 오인됐다.
+    if (offlineMessage && $('message')?.textContent === offlineMessage) message('');
+    offlineMessage = '';
+  } else {
+    controllerOnline = false;
+    controllerConnectionGeneration += 1;
+    if (publishing) {
+      // 재연결만으로 송출이 살아나지 않는다. 강사가 직접 다시 송출해야 한다는 사실을 남긴다.
+      rebroadcastRequired = true;
+      stopPublishing().catch((error) => message(error.message, true));
+    }
+  }
+  showRebroadcastNotice(state.online && rebroadcastRequired);
+  $('connection').textContent = state.online ? '서버 연결됨' : '연결 끊김';
+  $('connection').className = `status ${state.online ? 'status-online' : 'status-offline'}`;
+  if (!state.online && state.message) {
+    offlineMessage = state.message;
+    message(state.message, true);
+  }
 }
 
 // lecture는 강사 화면을 가려서는 안 되므로 아무 오버레이도 띄우지 않는다. lock의 차단막은 설계상
@@ -872,6 +944,18 @@ if (typeof module !== 'undefined' && module.exports) {
     FREEZE_MS,
     MAX_RESUBSCRIBE_ATTEMPTS,
     RESUBSCRIBE_BACKOFF_MS,
-    DEFAULT_VIDEO
+    DEFAULT_VIDEO,
+    withBusy,
+    broadcast,
+    captureWithTimeout,
+    handleControllerConnection,
+    currentActionGeneration: () => actionGeneration,
+    // 테스트 전용: 실제 앱에서는 화면 목록 클릭이 이 값을 정한다.
+    setSelectedSourceForTest: (id) => { selectedSourceId = id; },
+    ACTION_TIMEOUT_MS,
+    CAPTURE_TIMEOUT_MS,
+    ACTION_TIMEOUT,
+    CAPTURE_TIMEOUT,
+    ACTION_CANCELLED
   };
 }

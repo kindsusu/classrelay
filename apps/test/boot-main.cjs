@@ -14,7 +14,9 @@ const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'classrelay-test-'));
 process.on('exit', () => { try { fs.rmSync(TEMP_ROOT, { recursive: true, force: true }); } catch { /* 임시 폴더 정리 실패는 무시 */ } });
 let harnessSeq = 0;
 
-function bootMain(overrides = {}) {
+// options.singleInstanceLock은 두 번째 실행(잠금 실패)을 흉내내는 스위치다. 설정 내용과 섞이면
+// config.json에 새 필드가 들어가 버리므로 두 번째 인자로 분리한다.
+function bootMain(overrides = {}, { singleInstanceLock = true } = {}) {
   harnessSeq += 1;
   const dir = path.join(TEMP_ROOT, `boot-${harnessSeq}`);
   fs.mkdirSync(dir, { recursive: true });
@@ -43,6 +45,10 @@ function bootMain(overrides = {}) {
   let quitCount = 0;
   let clock = 1_000;
   let windowInstance;
+  const exitCalls = [];
+  // 예약된 타이머는 실행하지 않고 모아 둔다. 강제 종료 보험을 3초 동안 실제로 기다리지 않으려면
+  // main.cjs가 부르는 setTimeout 자체를 이 하네스가 들고 있어야 한다.
+  const timeouts = [];
 
   const guard = {
     stdin: {
@@ -74,6 +80,8 @@ function bootMain(overrides = {}) {
     loadFile() {}
     on() {}
     isVisible() { windowQueries.push('isVisible'); return this.visible && !this.minimized; }
+    isMinimized() { windowQueries.push('isMinimized'); return this.minimized; }
+    restore() { this.minimized = false; windowCalls.push('restore'); }
     isKiosk() { windowQueries.push('isKiosk'); return this.kiosk; }
     isFullScreen() { windowQueries.push('isFullScreen'); return this.fullScreen; }
     isAlwaysOnTop() { windowQueries.push('isAlwaysOnTop'); return this.alwaysOnTop; }
@@ -95,7 +103,9 @@ function bootMain(overrides = {}) {
       getLoginItemSettings: () => ({ openAtLogin: false }),
       setLoginItemSettings: () => {},
       isPackaged: false,
-      quit: () => { quitCount += 1; }
+      quit: () => { quitCount += 1; },
+      exit: (code) => { exitCalls.push(code); },
+      requestSingleInstanceLock: () => singleInstanceLock
     },
     BrowserWindow: FakeWindow,
     desktopCapturer: { getSources: async () => [] },
@@ -144,8 +154,13 @@ function bootMain(overrides = {}) {
     },
     setInterval: (callback) => { tick = callback; return 0; },
     clearInterval: () => {},
-    setTimeout,
-    clearTimeout
+    setTimeout: (callback, ms) => {
+      const entry = { ms, cleared: false, unrefed: false, run: () => { if (!entry.cleared) callback(); } };
+      const handle = { entry, unref: () => { entry.unrefed = true; return handle; } };
+      timeouts.push(entry);
+      return handle;
+    },
+    clearTimeout: (handle) => { if (handle?.entry) handle.entry.cleared = true; }
   };
   vm.runInNewContext(fs.readFileSync(path.join(SRC, 'main.cjs'), 'utf8'), context, { filename: 'main.cjs' });
 
@@ -161,6 +176,10 @@ function bootMain(overrides = {}) {
     quitCommand: () => socketOptions.onQuit(),
     emergency: () => shortcut(),
     beforeQuit: () => appEvents.get('before-quit')(),
+    secondInstance: () => appEvents.get('second-instance')?.(),
+    exitCalls: () => exitCalls,
+    timeouts: (ms) => (ms === undefined ? timeouts : timeouts.filter((entry) => entry.ms === ms)),
+    ipcChannels: () => [...ipcHandlers.keys(), ...ipcListeners.keys()],
     pulse: (mediaReady) => ipcListeners.get('renderer:pulse')({}, mediaReady),
     invoke: (channel, ...args) => ipcHandlers.get(channel)({}, ...args),
     listen: (channel, ...args) => ipcListeners.get(channel)({}, ...args),

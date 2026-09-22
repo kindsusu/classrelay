@@ -40,17 +40,25 @@ Performed on 2026-09-18 against the deployed Worker on its dedicated subdomain, 
 
 ## Observed on real hardware
 
-**Screen broadcast from one instructor machine to one student machine works.** That is the whole of it. One instructor, one student, one direction.
+**Screen broadcast from one instructor machine to one student machine works.** One instructor, one student, one direction.
+
+**2026-09-22, one instructor laptop and one student laptop, current build.** Three defects surfaced and were fixed in the app; none touched the Worker.
+
+- **The student quit command left a process behind once.** The student stopped streaming but `ClassRelay` stayed in Task Manager. The same command issued directly to the Worker reported `notified: 1`, the socket left the roster within a second, and the process then exited — so the server-to-app path works and the stall was in Electron's graceful quit. A three-second forced exit now follows `app.quit()`.
+- **The instructor app went dead.** Mode buttons did nothing and the message line read "server connection closed". A four-minute `wrangler tail` showed 76 events, all WebSocket heartbeats from two healthy sockets, and **zero HTTP requests** — no reconnect, no mode command, not even `/api/ice`. Restarting the instructor app cured it. The only path that never settles before the first HTTP call is `getDisplayMedia`, so the busy guard that disables the buttons was holding them forever. The capture call and every button action are now bounded (10 s and 30 s), and a stale offline message is cleared on reconnect. The exact hung call was not captured; the bound is what prevents a repeat.
+- **Four `ClassRelay` processes per machine is normal** — one Electron instance is main, GPU, renderer and utility. What was missing was a single-instance lock, so a second `run.bat` could start a second process with the same device identity; the apps now take the lock.
+
+**30 student tokens against the live Worker, 180 seconds** (synthetic sockets, not devices): all 30 connected in 2.1 s; the instructor's roster showed 30/30 in every one of 11 samples with no unexpected disconnects; the persisted `lastSeen` lagged at most 9.1 s against the 10 s design bound; `mediaReady` matched exactly; the roster emptied 284 ms after the sockets closed. A second connection with the same device ID closed the first with `1012 superseded`. A `lecture` or `lock` request with a stream the Controller did not publish was refused with 403.
 
 ## Not verified
 
 Stated plainly, because none of this has been exercised on a real device:
 
 - **The Windows input lock has never engaged.** `nativeInputLock` is `false` on every device configuration, so no lock has ever actually run. Every locking check so far has been a display check.
-- **The student-app shutdown has never run on a real device.** The transient-fanout behavior and the absence of a restart counterpart are covered by tests and by code review only.
+- **The student-app shutdown has run on one real device only**, and the forced-exit fallback added afterwards has not yet been exercised on hardware.
 - **Switching the shared screen has not been tried on real hardware.**
 - **Real throughput is unknown.** The only figure observed so far — roughly 15 kbps at 1 fps — was a static slide. It says what an idle screen costs, not what a class costs, and it cannot be used for capacity planning. The capacity figures in the documentation remain arithmetic.
-- **30 devices, and the five-hour soak.**
+- **30 real devices, and the five-hour soak.** The 30-socket live soak above exercised the control plane only, not video, not input locking, and not thirty Wi-Fi networks.
 - **Login auto-start.**
 - **Whether the recent fix removed the reported student-screen flicker.** The change stopped the Agent from reapplying its window state on every five-second heartbeat, which is a plausible cause, but nobody has watched a student screen since.
 
@@ -58,7 +66,7 @@ Before operation, work through the [physical device acceptance checklist](accept
 
 ## Automated tests and continuous integration
 
-- Backend: 61 tests. Desktop apps: 128 tests. Backend type checking and the desktop syntax check pass.
+- Backend: 73 tests. Desktop apps: 143 tests. Backend type checking and the desktop syntax check pass.
 - CI on the default branch is green. It runs the backend tests, the backend typecheck, the apps tests, the apps syntax check, a local 30-connection WebSocket smoke test, the native helper build, `InputGuard.exe --self-test`, and a Worker deployment dry-run.
 - The native helper is exercised only with `--self-test`, which updates state without installing a live input hook. It has never suppressed real input.
 - Backend SFU calls are mocked in tests. The mock now matches the measured live contract for session creation; the `/tracks/new` half of the mock is an assumption, and is marked as one in the test file. A mock that does not match reality lets a fully green suite hide a product that cannot work — that is exactly what happened with the session-creation order.
