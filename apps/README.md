@@ -17,9 +17,10 @@ Both roles keep one authenticated WebSocket connection to `/api/connect`. The ba
 
 ## Local development
 
-Install dependencies and create a Controller configuration:
+Run the following commands in PowerShell from the repository root. Enter `apps/` first, then install dependencies and create a Controller configuration. The repository root has no `package.json`:
 
 ```powershell
+Set-Location -LiteralPath .\apps
 npm install
 Copy-Item -LiteralPath .\config.controller.example.json -Destination .\config.controller.json
 # Update backendUrl, token, and deviceId in config.controller.json

@@ -17,9 +17,10 @@ Controller는 강사가 선택한 화면을 Cloudflare Realtime SFU에 송출합
 
 ## 로컬 개발
 
-의존성을 설치하고 Controller 설정을 만듭니다.
+아래 명령은 저장소 루트의 PowerShell에서 시작합니다. 먼저 `apps/`로 이동한 뒤 의존성을 설치하고 Controller 설정을 만듭니다. 저장소 루트에는 `package.json`이 없습니다.
 
 ```powershell
+Set-Location -LiteralPath .\apps
 npm install
 Copy-Item -LiteralPath .\config.controller.example.json -Destination .\config.controller.json
 # config.controller.json의 backendUrl, token, deviceId를 수정
